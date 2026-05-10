@@ -33,7 +33,12 @@ const INVINCIBLE_MS   = 1500;
 // world bounds keep working normally.
 const JUMP_DURATION_MS = 520;
 const JUMP_HEIGHT_PX   = 38;
-const JUMP_COOLDOWN_MS = 180;
+// Total lockout per jump = JUMP_DURATION_MS + JUMP_COOLDOWN_MS. Was 700 ms
+// (520+180), which is just slow enough that natural pillar-to-pillar tap
+// rhythm on touch devices lands ~half its presses inside the still-
+// rejecting cooldown window. Dropped to 80 ms (=> 600 ms total lockout)
+// so back-to-back rhythmic jumps register reliably.
+const JUMP_COOLDOWN_MS = 80;
 
 const LABEL_DISTANCE = 180;
 
@@ -3313,12 +3318,12 @@ class GameScene extends Phaser.Scene {
   createJumpButton() {
     const x = GAME_W - 70;
     const y = GAME_H - 70;
-    // Visible ring stays at 42, but the tappable region is bumped to 52
-    // so off-center thumbs still register. Without this the bottom-right
-    // corner of the iPad in landscape is a particularly fiddly place to
-    // hit a 42-px circle while also dragging the joystick.
+    // Visible ring stays at 42, but the tappable region is bumped way up
+    // to 64 so off-center thumbs still register on iPad landscape. Trying
+    // to hit a 42-px circle in the bottom-right corner while the other
+    // thumb drags the joystick is a fiddly task; double the slack helps.
     const visualR = 42;
-    const hitR = 52;
+    const hitR = 64;
     this.jumpBtn = this.add.container(x, y).setScrollFactor(0).setDepth(11500);
 
     const bg = this.add.graphics();
@@ -3343,16 +3348,17 @@ class GameScene extends Phaser.Scene {
       Phaser.Geom.Circle.Contains,
     );
     this.jumpBtn.on('pointerdown', (p) => {
-      // Tap feedback: every pointerdown squishes the button briefly so
-      // the player gets visual acknowledgment EVEN IF jump itself is on
-      // cooldown. Eliminates the "sticky / unresponsive" feel when taps
-      // land mid-airborne or in the cooldown tail. The squish targets
-      // the container, so label + ring + hint scale together.
-      this.tweens.killTweensOf(this.jumpBtn);
-      this.jumpBtn.setScale(1);
+      // Tap feedback: pulse the LABEL only (not the container), so the
+      // hit area stays at its full 64-px radius during the animation.
+      // (A previous version scaled the whole container, which silently
+      // shrank the hit-test circle to ~55 px during the 130 ms tween and
+      // caused edge-of-button taps to be ignored - exactly the "sticky"
+      // intermittent miss the user reported.)
+      this.tweens.killTweensOf(this.jumpBtnLabel);
+      this.jumpBtnLabel.setScale(1);
       this.tweens.add({
-        targets: this.jumpBtn,
-        scale: { from: 0.86, to: 1 },
+        targets: this.jumpBtnLabel,
+        scale: { from: 1.28, to: 1 },
         duration: 130,
         ease: 'Cubic.easeOut',
       });
