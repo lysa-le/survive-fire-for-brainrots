@@ -33,3 +33,90 @@ noscript {
   display: block;
   padding: 2rem;
 }
+
+/* ----------------------------------------------------------------------
+ * Rotate-to-landscape overlay.
+ *
+ * Game is designed for a 1.39:1 landscape canvas. On a portrait phone or
+ * tablet, Phaser's FIT scale mode letterboxes the canvas into the top/
+ * bottom of the screen which makes the HUD feel tiny. We solve that by
+ * showing a fullscreen prompt whenever a TOUCH device is held in portrait,
+ * asking the player to rotate. Desktop users (who detect as hover:hover /
+ * pointer:fine) are never shown this overlay even if their window happens
+ * to be portrait-shaped.
+ * ---------------------------------------------------------------------- */
+.rotate-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: #1a0f1f;
+  color: #ffffff;
+  z-index: 9999;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 2rem;
+}
+
+.rotate-overlay__icon {
+  width: 76px;
+  height: 124px;
+  border: 4px solid #ffe066;
+  border-radius: 14px;
+  position: relative;
+  margin-bottom: 28px;
+  animation: rotate-phone 2.4s ease-in-out infinite;
+}
+
+.rotate-overlay__icon::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 26px;
+  height: 4px;
+  background: #ffe066;
+  border-radius: 2px;
+}
+
+.rotate-overlay__icon::after {
+  content: "";
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 14px;
+  height: 14px;
+  border: 2px solid #ffe066;
+  border-radius: 50%;
+}
+
+@keyframes rotate-phone {
+  0%, 35%   { transform: rotate(0deg); }
+  60%, 100% { transform: rotate(-90deg); }
+}
+
+.rotate-overlay__title {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: #ffe066;
+  letter-spacing: 0.02em;
+}
+
+.rotate-overlay__body {
+  font-size: 16px;
+  line-height: 1.4;
+  max-width: 320px;
+  opacity: 0.85;
+}
+
+/* Show only on touch devices held in portrait. Desktop browsers that have
+ * a tall window stay untouched. */
+@media (orientation: portrait) and (hover: none) and (pointer: coarse) {
+  .rotate-overlay {
+    display: flex;
+  }
+}
