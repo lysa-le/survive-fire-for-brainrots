@@ -748,12 +748,10 @@ class VirtualJoystick {
     this.currentX = 0; this.currentY = 0;
     this.maxRadius = 70;
 
-    this.outer = scene.add.circle(0, 0, this.maxRadius, 0xffffff, 0.18)
-      .setStrokeStyle(3, 0xffffff, 0.4)
-      .setVisible(false).setScrollFactor(0).setDepth(11000);
-    this.inner = scene.add.circle(0, 0, 28, 0xffe066, 0.85)
-      .setStrokeStyle(2, 0xffffff, 0.8)
-      .setVisible(false).setScrollFactor(0).setDepth(11001);
+    // Invisible joystick: drag anywhere on the left 60% of the screen to
+    // move. We intentionally don't render the touch-down ring or the
+    // gold thumb dot - they were obscuring the player avatar on phones.
+    // The drag math (getVector) is identical to a visualised joystick.
 
     scene.input.on('pointerdown', this.onDown, this);
     scene.input.on('pointermove', this.onMove, this);
@@ -767,8 +765,6 @@ class VirtualJoystick {
     this.pointerId = p.id;
     this.startX = p.x; this.startY = p.y;
     this.currentX = p.x; this.currentY = p.y;
-    this.outer.setPosition(p.x, p.y).setVisible(true);
-    this.inner.setPosition(p.x, p.y).setVisible(true);
   }
   onMove(p) {
     if (!this.active || p.id !== this.pointerId) return;
@@ -778,14 +774,11 @@ class VirtualJoystick {
     if (d > this.maxRadius) { dx = (dx / d) * this.maxRadius; dy = (dy / d) * this.maxRadius; }
     this.currentX = this.startX + dx;
     this.currentY = this.startY + dy;
-    this.inner.setPosition(this.currentX, this.currentY);
   }
   onUp(p) {
     if (p.id !== this.pointerId) return;
     this.active = false;
     this.pointerId = null;
-    this.outer.setVisible(false);
-    this.inner.setVisible(false);
   }
   getVector() {
     if (!this.active) return { x: 0, y: 0 };
