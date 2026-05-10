@@ -1029,6 +1029,15 @@ class GameScene extends Phaser.Scene {
   create(data) {
     Sfx.init(); Sfx.resume();
 
+    // Multi-touch: Phaser 3 only registers 1 active touch by default, which
+    // means a player dragging the joystick with their left thumb couldn't
+    // also tap the JUMP / ability buttons with their right thumb - the
+    // second touch would be silently dropped. addPointer(2) reserves two
+    // extra pointer slots so the player can hold the joystick AND tap a
+    // button (or two buttons) simultaneously. Critical for L4 pillar-to-
+    // pillar jumps which require movement + jump in the same instant.
+    this.input.addPointer(2);
+
     // Phaser destroys non-main cameras on scene shutdown but the references
     // on `this` persist - null them out so setupCameras() builds fresh ones
     // on every level start / restart.
@@ -3304,14 +3313,19 @@ class GameScene extends Phaser.Scene {
   createJumpButton() {
     const x = GAME_W - 70;
     const y = GAME_H - 70;
-    const r = 42;
+    // Visible ring stays at 42, but the tappable region is bumped to 52
+    // so off-center thumbs still register. Without this the bottom-right
+    // corner of the iPad in landscape is a particularly fiddly place to
+    // hit a 42-px circle while also dragging the joystick.
+    const visualR = 42;
+    const hitR = 52;
     this.jumpBtn = this.add.container(x, y).setScrollFactor(0).setDepth(11500);
 
     const bg = this.add.graphics();
     bg.fillStyle(0x1a0f1f, 0.55);
-    bg.fillCircle(0, 0, r);
+    bg.fillCircle(0, 0, visualR);
     bg.lineStyle(3, 0xffe066, 0.85);
-    bg.strokeCircle(0, 0, r);
+    bg.strokeCircle(0, 0, visualR);
     const label = this.add.text(0, -2, 'JUMP', {
       fontFamily: 'Impact, Charcoal, sans-serif',
       fontSize: '18px', color: '#ffe066',
@@ -3323,14 +3337,25 @@ class GameScene extends Phaser.Scene {
     this.jumpBtnBg = bg;
     this.jumpBtnLabel = label;
     this.jumpBtn.add([bg, label, hint]);
-    this.jumpBtn.setSize(r * 2, r * 2);
-    // Hit area as a circle so taps in the corner don't accidentally
-    // register against the joystick (which uses the left half of screen).
+    this.jumpBtn.setSize(hitR * 2, hitR * 2);
     this.jumpBtn.setInteractive(
-      new Phaser.Geom.Circle(0, 0, r),
+      new Phaser.Geom.Circle(0, 0, hitR),
       Phaser.Geom.Circle.Contains,
     );
     this.jumpBtn.on('pointerdown', (p) => {
+      // Tap feedback: every pointerdown squishes the button briefly so
+      // the player gets visual acknowledgment EVEN IF jump itself is on
+      // cooldown. Eliminates the "sticky / unresponsive" feel when taps
+      // land mid-airborne or in the cooldown tail. The squish targets
+      // the container, so label + ring + hint scale together.
+      this.tweens.killTweensOf(this.jumpBtn);
+      this.jumpBtn.setScale(1);
+      this.tweens.add({
+        targets: this.jumpBtn,
+        scale: { from: 0.86, to: 1 },
+        duration: 130,
+        ease: 'Cubic.easeOut',
+      });
       this.tryJump(this.time.now);
       // Stop joystick from also picking up this tap if it leaks.
       p?.event?.stopPropagation?.();
@@ -5072,6 +5097,11 @@ class BossScene extends Phaser.Scene {
 
   create(data) {
     Sfx.init(); Sfx.resume();
+
+    // Same multi-touch reservation as GameScene: the boss fight has 4
+    // ability buttons + a virtual joystick + hold-to-channel Hydra. Without
+    // this, holding the joystick blocks taps on ability slots.
+    this.input.addPointer(2);
 
     // Same camera-reset prologue as GameScene so scene restarts (death loop)
     // don't leave stale skyCamera / uiCamera references behind.
