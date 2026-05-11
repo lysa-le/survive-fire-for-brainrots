@@ -1222,9 +1222,20 @@ The "Your progress is saved." line is `12 px` system-italic in the same dusty-pu
 After defeating Los Hackers, `BossScene.handleVictory()` writes `bossDefeated: true` to save and routes to WinScene as before. WinScene now branches on `bossDefeated`:
 
 **Boss path (`bossDefeated === true`):**
-- Two side-by-side CTAs centered at `H * 0.92`, sharing the same proportions as the level-complete modal button row (200 px each, 14 px gap):
-  - **Left — `↺  Start over` (secondary):** dim outlined pill, gold-on-hover. **Tap-twice-to-confirm:** first tap morphs the button into a red-warning state with `Tap again to confirm`; second tap calls `SaveState.reset()` and routes to Title. If the second tap doesn't land within 5 seconds, the button reverts to its idle copy so an accidental first tap can't sit armed forever. Pointer-only — no keyboard binding so a stray keypress can't trigger destructive flow.
-  - **Right — `↻  Keep playing` (primary):** purple-with-gold-on-hover pill matching the level-complete primary CTA. Routes to Title with save intact (all 5 pills unlocked in prod mode). Also bound to SPACE / ENTER as the safe default.
+
+Two views, toggled in place. Both views use the same button row proportions as the level-complete modal (200 px each, 14 px gap, centered at `H * 0.92`).
+
+**Primary view (default):**
+- **Left — `↺  Start over` (secondary):** dim outlined pill, gold-on-hover. Tap → swaps to confirm view.
+- **Right — `↻  Keep playing` (primary):** purple-with-gold-on-hover pill. Routes to Title with save intact (all 5 pills unlocked in prod mode). Also bound to SPACE / ENTER as the safe default.
+
+**Confirm view (after tapping Start over):**
+- Warning copy above the row, warm-pink `16 px`: `Do you really want to lose all your brainrots and start over?`
+- **Left — `Yes, Start over` (destructive):** red-outlined pill with warm-pink text, red fill on hover. Calls `SaveState.reset()` and routes to Title.
+- **Right — `No, Go back` (primary):** same purple-gold styling as Keep playing — the safer action gets the most visually inviting CTA on purpose so an impulsive tap leans toward NOT nuking save. Reverts the row back to the primary view.
+- Auto-disarms after 5 s if the player doesn't pick either option, falling back to the primary view so an accidental tap can't strand them on the destructive dialog forever.
+
+Both Start over and Yes, Start over are pointer-only (no keyboard binding) so a stray SPACE / ENTER can never trigger destructive flow — those keys always run the safe default.
 
 **Non-boss path (`bossDefeated !== true`):**
 - Cheat-jumped runs that reached WinScene without a boss kill keep the original single `↻ PLAY AGAIN` button that drops back to Game with `levelId: 1`. No reset link — there's no progression earned to reset.

@@ -7927,30 +7927,29 @@ class WinScene extends Phaser.Scene {
      * game" feel. That path doesn't need a reset prompt because no
      * progression was earned. */
 
-    // makeWinButton mirrors the level-complete modal button styling so
-    // the two screens feel consistent. Primary = purple-with-gold-on-
-    // hover pill; secondary = dim outlined pill that lifts to gold on
-    // hover. Returns an object with .setLabel/.setPrimary/.setMode so
-    // tap-twice-to-confirm on Start over can swap the visual state.
-    const makeWinButton = ({ x, y, w, h, label, primary, onClick }) => {
-      let isPrimary = primary;
-      let isWarning = false;
+    // makeWinButton mirrors the level-complete modal button styling so the
+    // two screens feel consistent. Three styles:
+    //   'primary'     - purple fill + gold-on-hover ring (safe default CTA)
+    //   'secondary'   - dim outlined pill that lifts to gold on hover
+    //   'destructive' - red outline + warm-pink text, red fill on hover
+    // Returns { nodes } so callers can show/hide the whole button as a
+    // group when swapping between the two-button views.
+    const makeWinButton = ({ x, y, w, h, label, style, onClick }) => {
       const bg = this.add.graphics();
       const draw = (hover) => {
         bg.clear();
-        if (isWarning) {
-          // Armed-confirm state: red fill + ring so the player can't
-          // miss that the next tap is destructive.
-          bg.fillStyle(hover ? 0x6e1f1f : 0x4f1717, 0.95);
+        if (style === 'destructive') {
+          bg.fillStyle(hover ? 0x6e1f1f : 0x2a1414, 0.85);
           bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
-          bg.lineStyle(3, 0xff7a7a, 1.0);
+          bg.lineStyle(2, hover ? 0xff9a9a : 0xa84f4f, 1.0);
           bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
-        } else if (isPrimary) {
+        } else if (style === 'primary') {
           bg.fillStyle(hover ? 0x4a3f6a : 0x32254a, 0.95);
           bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
           bg.lineStyle(3, hover ? 0xffe066 : 0xcbb3ff, 1.0);
           bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
         } else {
+          // secondary
           bg.fillStyle(0x1a0f1f, 0.65);
           bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
           bg.lineStyle(2, hover ? 0xcbb3ff : 0x6a4f6a, 1.0);
@@ -7958,10 +7957,13 @@ class WinScene extends Phaser.Scene {
         }
       };
       draw(false);
+      const idleColor = style === 'primary' ? '#ffffff'
+        : style === 'destructive' ? '#ffd6d6'
+        : '#cbb3ff';
       const text = this.add.text(x, y, label, {
         fontFamily: 'Impact, Charcoal, sans-serif',
-        fontSize: primary ? '22px' : '19px',
-        color: primary ? '#ffffff' : '#cbb3ff',
+        fontSize: style === 'primary' ? '22px' : '19px',
+        color: idleColor,
         stroke: '#1a0f1f', strokeThickness: 3,
         letterSpacing: 1,
       }).setOrigin(0.5);
@@ -7969,18 +7971,15 @@ class WinScene extends Phaser.Scene {
       hit.setInteractive({ useHandCursor: true });
       hit.on('pointerover', () => {
         draw(true);
-        if (!isPrimary && !isWarning) text.setColor('#ffe066');
+        if (style === 'secondary') text.setColor('#ffe066');
+        if (style === 'destructive') text.setColor('#ffffff');
       });
       hit.on('pointerout', () => {
         draw(false);
-        if (!isPrimary && !isWarning) text.setColor('#cbb3ff');
+        text.setColor(idleColor);
       });
       hit.on('pointerdown', onClick);
-      return {
-        setLabel: (s) => text.setText(s),
-        setColor: (c) => text.setColor(c),
-        setWarning: (on) => { isWarning = on; draw(false); },
-      };
+      return { nodes: [bg, text, hit] };
     };
 
     // Boss-cleared default: head back to title and let the player pick
@@ -8004,46 +8003,78 @@ class WinScene extends Phaser.Scene {
       const leftX = W / 2 - totalW / 2 + sideW / 2;
       const rightX = W / 2 + totalW / 2 - sideW / 2;
 
-      // Tap-twice-to-confirm Start over. State machine:
-      //   idle -> '\u21BA  Start over' (purple secondary)
-      //   armed -> 'Tap again to start over' (red warning)
-      //   confirmed -> SaveState.reset(); back to Title
-      // Idle reverts after 5 s if the second tap never lands so an
-      // accidental first tap can't sit armed forever.
-      let armed = false;
-      let armTimer = null;
-      let resetBtn;
-      const disarm = () => {
-        armed = false;
-        resetBtn.setLabel('\u21BA  Start over');
-        resetBtn.setWarning(false);
-        if (armTimer) { armTimer.remove(false); armTimer = null; }
+      // Two views, toggled by visibility:
+      //   primary view -> [Start over] [Keep playing]
+      //   confirm view -> warning copy + [Yes, Start over] [No, Go back]
+      // We build both upfront and flip visibility on tap so the auto-
+      // disarm timer can reuse the same nodes without rebuilding.
+      const primaryNodes = [];
+      const confirmNodes = [];
+      const setView = (which) => {
+        const showConfirm = which === 'confirm';
+        primaryNodes.forEach((n) => n.setVisible(!showConfirm));
+        confirmNodes.forEach((n) => n.setVisible(showConfirm));
       };
-      resetBtn = makeWinButton({
+
+      // 5 s auto-revert from confirm back to primary so an accidental
+      // tap on Start over can't strand the player on the destructive
+      // dialog forever.
+      let armTimer = null;
+      const disarm = () => {
+        if (armTimer) { armTimer.remove(false); armTimer = null; }
+        setView('primary');
+      };
+      const arm = () => {
+        if (armTimer) armTimer.remove(false);
+        armTimer = this.time.delayedCall(5000, disarm);
+        setView('confirm');
+      };
+
+      // ----- Primary view -----
+      primaryNodes.push(...makeWinButton({
         x: leftX, y: btnY, w: sideW, h: btnH,
         label: '\u21BA  Start over',
-        primary: false,
+        style: 'secondary',
+        onClick: arm,
+      }).nodes);
+      primaryNodes.push(...makeWinButton({
+        x: rightX, y: btnY, w: sideW, h: btnH,
+        label: '\u21BB  Keep playing',
+        style: 'primary',
+        onClick: primaryAction,
+      }).nodes);
+
+      // ----- Confirm view -----
+      // Warning copy spans the full row above the buttons. 16 px sans-
+      // serif in warm pink - readable but doesn't shout.
+      confirmNodes.push(this.add.text(W / 2, btnY - btnH / 2 - 26,
+        'Do you really want to lose all your brainrots and start over?', {
+        fontFamily: 'system-ui, sans-serif',
+        fontSize: '16px', color: '#ffd6d6',
+        align: 'center',
+        wordWrap: { width: W - 80, useAdvancedWrap: true },
+      }).setOrigin(0.5));
+      // Yes (destructive, left) + No (primary, right). "No" gets primary
+      // styling on purpose - the safer action is the most visually
+      // inviting one so an impulsive tap leans toward NOT nuking save.
+      confirmNodes.push(...makeWinButton({
+        x: leftX, y: btnY, w: sideW, h: btnH,
+        label: 'Yes, Start over',
+        style: 'destructive',
         onClick: () => {
-          if (!armed) {
-            armed = true;
-            resetBtn.setLabel('Tap again to confirm');
-            resetBtn.setColor('#ffd6d6');
-            resetBtn.setWarning(true);
-            armTimer = this.time.delayedCall(5000, disarm);
-            return;
-          }
           if (armTimer) { armTimer.remove(false); armTimer = null; }
           SaveState.reset();
           this.scene.start('Title');
         },
-      });
-
-      makeWinButton({
+      }).nodes);
+      confirmNodes.push(...makeWinButton({
         x: rightX, y: btnY, w: sideW, h: btnH,
-        label: '\u21BB  Keep playing',
-        primary: true,
-        onClick: primaryAction,
-      });
+        label: 'No, Go back',
+        style: 'primary',
+        onClick: disarm,
+      }).nodes);
+
+      setView('primary');
     } else {
       // Cheat-jumped non-boss runs keep the original single PLAY AGAIN
       // pill - no reset prompt because no progression was earned.
