@@ -1,6 +1,6 @@
 # Survive Fire for Brainrots — Descoped Spec (1-Day Web Build)
 
-**Version**: 0.6.1e (Touch hit-test rebuild + shake coalescing)
+**Version**: 0.6.1f (Visible-viewport canvas sizing)
 **Last updated**: 2026-05-11
 **Status**: Active build target
 **Relation to north star**: This is a *radically descoped* version of [`GAME_SPEC.md`](./GAME_SPEC.md). The original full-fidelity spec remains the long-term north star. This document defines what we're actually building **today** in a single-day, $0 budget web prototype.
@@ -1130,7 +1130,22 @@ After 21.x shipped, iPad playtest still showed JUMP button taps registering left
 - Added `shakeOnce(durationMs, intensity)` helper on GameScene. Tracks `_shakeBusyUntil` and skips if a previously-issued shake is still in-flight, so back-to-back triggers collapse into one continuous shake instead of compounding.
 - Player-hit shake (`onPlayerHit`) and game-over shake stay on `cameras.main.shake()` directly — those are one-time events per trigger and we want them to land at full force.
 
-### 22.3 Things deliberately NOT touched
+### 22.3 Follow-up: title screen cut off on iPhone landscape (v0.6.1f)
+
+After 22.x shipped, iPhone landscape playtest showed the title screen's level pills + `⚡ BOSS (dev)` button + drag-hint text falling below the visible area. JUMP and shake on gameplay scenes still worked correctly.
+
+**Root cause:** `100dvh` is the spec-correct way to size a container to the dynamic visible viewport, but **iOS Safari's `dvh` returns the URL-bar-hidden height** in some versions / at first paint when the URL bar is still showing. With `#game-container { height: 100dvh }`, the container ended up ~60 px taller than the actual visible area, Phaser's `Scale.FIT` sized the canvas to that taller rect, and the bottom of the canvas slipped behind the iOS chrome. JUMP / shake worked because gameplay buttons live near the canvas's vertical center, but title elements at `H * 0.85` and `H - 16` got cropped.
+
+Also: TitleScene had no `scale.refresh()` listeners. GameScene/BossScene refreshed on every viewport change but the title screen was rendering at first-paint dimensions forever.
+
+**Fix:**
+1. **Inline script in `index.html`** (runs before Phaser loads): mirrors `window.visualViewport.height/width` into CSS variables `--vvh` / `--vvw`. visualViewport is the only API that reports the *actually visible* area at all times, including with the URL bar showing.
+2. **`style.css`**: `#game-container` now uses `var(--vvh, 100dvh)` / `var(--vvw, 100dvw)` for height/width. Three-step fallback: `vh` → `dvh` → CSS variable. Modern iOS reads the variable; older browsers walk back up the cascade.
+3. **`bindViewportRefresh(scene)` helper** in game.js: pulled the duplicated listener boilerplate out of GameScene/BossScene into one free function. Adds `visualViewport.resize` (the missing event for iOS URL-bar transitions) on top of the existing `resize` / `orientationchange` / `pageshow` set. Now also called from `TitleScene.create()`, which previously had no refresh listeners at all.
+
+After this, the title fills the visible viewport on first paint with the URL bar showing, and re-fits cleanly when the user scrolls to hide it or rotates between landscape and portrait.
+
+### 22.4 Things deliberately NOT touched
 
 - **Issue 2 (missing meteor fires on L2)** — known to be a depth-stacking bug (fires render at `-7..-5`, desert decorations at `(y+1)*32`, so cacti / boulders cover them). User chose to defer.
 - **`cameras.main.setZoom(GAME_ZOOM)`** — the zoom is load-bearing for how the world reads visually. Removing it would have been a much bigger blast radius than swapping how the buttons hit-test.

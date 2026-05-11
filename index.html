@@ -8,6 +8,39 @@
   <meta name="theme-color" content="#1a0f1f" />
   <title>Survive Fire for Brainrots</title>
   <link rel="stylesheet" href="style.css" />
+  <script>
+    // iOS Safari quirk: 100dvh is supposed to track the dynamic visible
+    // viewport, but on some versions (and at first paint with the URL
+    // bar still showing) it returns the URL-bar-hidden height instead.
+    // Result: #game-container ends up taller than the visible area and
+    // the bottom of the canvas - title-screen level buttons, boss pill,
+    // dev hint - is hidden behind the browser chrome.
+    //
+    // window.visualViewport reports the EXACT visible area, including
+    // any chrome currently on screen. We mirror its width/height into
+    // CSS variables --vvw / --vvh, and #game-container reads them with
+    // 100dvw / 100dvh as fallbacks. Updates fire on every event that can
+    // reshape the visual viewport: orientation flip, URL bar show/hide,
+    // bfcache restore (pageshow), keyboard appearance.
+    (function () {
+      const root = document.documentElement;
+      const apply = () => {
+        const vv = window.visualViewport;
+        const w = vv ? vv.width : window.innerWidth;
+        const h = vv ? vv.height : window.innerHeight;
+        root.style.setProperty('--vvw', w + 'px');
+        root.style.setProperty('--vvh', h + 'px');
+      };
+      apply();
+      window.addEventListener('resize', apply);
+      window.addEventListener('orientationchange', apply);
+      window.addEventListener('pageshow', apply);
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', apply);
+        window.visualViewport.addEventListener('scroll', apply);
+      }
+    })();
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
 </head>
 <body>

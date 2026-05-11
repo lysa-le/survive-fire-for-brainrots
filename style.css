@@ -13,34 +13,41 @@ html, body {
   touch-action: none;
 }
 
-/* The container is anchored to the visible viewport (position: fixed +
- * inset: 0) so it never grows taller than the actual on-screen area.
+/* The container is sized to the EXACT visible viewport - no taller, no
+ * shorter - so Phaser's Scale.FIT computation never produces a canvas
+ * that exceeds the visible area.
  *
- * 100dvh (dynamic viewport height) instead of 100vh keeps it correct on
- * iOS Safari, where 100vh is the *largest possible* viewport (chrome
- * fully retracted) - that mismatch was shifting the canvas off the
- * visible area when the URL bar was showing, which in turn made every
- * touch coordinate Phaser computed land slightly down-and-right of where
- * the user's finger actually was. The most visible symptom was the JUMP
- * button only registering taps from its upper-left quadrant on iPad.
+ * Sizing chain (largest fallback first, most precise last):
+ *   1. 100vh / 100vw          - works in every browser, but iOS Safari
+ *                                returns the URL-bar-hidden height for
+ *                                100vh, overflowing the visible area.
+ *   2. 100dvh / 100dvw        - dynamic viewport. Spec-correct on Chrome
+ *                                / Edge / recent Safari but unreliable on
+ *                                some iOS versions (returns the *largest*
+ *                                viewport at page load even when the URL
+ *                                bar is showing).
+ *   3. var(--vvh) / var(--vvw) - inline-script-driven. Reads
+ *                                window.visualViewport.height/width which
+ *                                is THE source of truth for what the user
+ *                                can actually see. See the inline script
+ *                                in index.html for the wiring + listeners.
  *
- * IMPORTANT: We deliberately do NOT use display:flex / align-items / max-*
- * here. Phaser's Scale.FIT + autoCenter:CENTER_BOTH already sizes and
- * centers the canvas via inline styles + margin:auto. Adding flex layout
- * on top of that creates two layout systems competing for the canvas size
- * and produces an oval JUMP button (canvas stretched non-uniformly) plus
- * a stale pointer-bounds rect (taps register offset from where the user
- * tapped). Let Phaser fully own the canvas sizing.
- *
- * 100svh / 100lvh are siblings of 100dvh; we use the dynamic value so
- * the container resizes smoothly when chrome shows/hides. */
+ * We deliberately do NOT use display:flex / align-items / max-* here.
+ * Phaser's Scale.FIT + autoCenter:CENTER_BOTH already sizes and centers
+ * the canvas via inline styles + margin:auto. Adding flex layout on top
+ * of that creates two layout systems competing for the canvas size and
+ * produces an oval JUMP button (canvas stretched non-uniformly) plus a
+ * stale pointer-bounds rect (taps register offset from where the user
+ * tapped). Let Phaser fully own the canvas sizing. */
 #game-container {
   position: fixed;
   inset: 0;
   width: 100vw;
   width: 100dvw;
+  width: var(--vvw, 100dvw);
   height: 100vh;
   height: 100dvh;
+  height: var(--vvh, 100dvh);
 }
 
 #game-container canvas {

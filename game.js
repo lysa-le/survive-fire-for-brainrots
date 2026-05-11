@@ -879,6 +879,51 @@ class VirtualJoystick {
 }
 
 /* ============================================================================
+   Viewport refresh helper
+
+   iOS Safari changes the visible viewport in three sneaky ways:
+   1. URL bar shows / hides as the user scrolls or interacts.
+   2. orientationchange fires BEFORE layout has settled.
+   3. bfcache restore (pageshow) resumes the page without firing resize.
+
+   Whenever the visible viewport changes shape, Phaser's cached canvas-
+   bounding-rect goes stale, and pointer math + canvas size start
+   drifting. This helper wires every event that can reshape the visible
+   area to a single `scale.refresh()` call, plus a defensive 80 ms
+   delayed refresh to catch orientationchange that fires before layout
+   has settled.
+
+   Using a free function keeps it identical across TitleScene / GameScene
+   / BossScene; previously only the gameplay scenes had this and the
+   title screen would render the canvas oversized at first paint.
+   ============================================================================ */
+
+function bindViewportRefresh(scene) {
+  const handler = () => scene.scale.refresh();
+  window.addEventListener('resize', handler);
+  window.addEventListener('orientationchange', handler);
+  window.addEventListener('pageshow', handler);
+  // visualViewport.resize is THE event for iOS URL-bar show/hide. Plain
+  // window.resize doesn't always fire for those transitions, which is
+  // how the title screen ended up with the canvas overflowing the
+  // visible area on iPhone landscape.
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', handler);
+  }
+  scene.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+    window.removeEventListener('resize', handler);
+    window.removeEventListener('orientationchange', handler);
+    window.removeEventListener('pageshow', handler);
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', handler);
+    }
+  });
+  scene.time.delayedCall(80, () => {
+    if (scene.scene.isActive()) scene.scale.refresh();
+  });
+}
+
+/* ============================================================================
    Boot Scene
    ============================================================================ */
 
@@ -939,6 +984,15 @@ class BootScene extends Phaser.Scene {
 class TitleScene extends Phaser.Scene {
   constructor() { super('Title'); }
   create() {
+    // Force the canvas to fit the actual visible viewport before we lay
+    // out any UI. Without this, iOS Safari first-paint with the URL bar
+    // showing was reporting #game-container as URL-bar-hidden tall, the
+    // canvas was sized to that taller rect, and the bottom of the title
+    // (level pills, BOSS dev pill, drag-hint text) fell behind the
+    // browser chrome. bindViewportRefresh also re-fires on every chrome
+    // show/hide / orientation flip / bfcache restore.
+    bindViewportRefresh(this);
+
     const W = this.scale.width;
     const H = this.scale.height;
     this.cameras.main.setBackgroundColor('#1a0f1f');
@@ -1162,37 +1216,7 @@ class GameScene extends Phaser.Scene {
     // pillar jumps which require movement + jump in the same instant.
     this.input.addPointer(2);
 
-    // iOS Safari shows / hides its URL bar dynamically as the user
-    // interacts. When that happens the visual viewport changes size but
-    // Phaser's cached canvas-bounding-rect doesn't auto-update - so touch
-    // coordinates start landing in the wrong spot. Listening to window
-    // resize + orientationchange + pageshow and forcing a Scale.refresh()
-    // keeps pointer math in sync.
-    //
-    // pageshow specifically catches the bfcache restore path: when the user
-    // backgrounds Safari and returns, the page resumes from the back-forward
-    // cache and resize/orientationchange may not fire. Without this hook,
-    // the canvas snapped back to a smaller frame and taps registered way
-    // off-target until the next manual refresh.
-    //
-    // Cleanup on SHUTDOWN so we don't leak listeners between scene
-    // transitions.
-    this._touchRefreshHandler = () => this.scale.refresh();
-    window.addEventListener('resize', this._touchRefreshHandler);
-    window.addEventListener('orientationchange', this._touchRefreshHandler);
-    window.addEventListener('pageshow', this._touchRefreshHandler);
-    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
-      window.removeEventListener('resize', this._touchRefreshHandler);
-      window.removeEventListener('orientationchange', this._touchRefreshHandler);
-      window.removeEventListener('pageshow', this._touchRefreshHandler);
-    });
-    // Defensive late refresh: iOS Safari sometimes fires orientationchange
-    // *before* layout has settled, so the dimensions Phaser reads in its
-    // first scale pass are stale. A single delayed refresh (~80 ms) catches
-    // anything that arrived mid-flight without slowing scene start.
-    this.time.delayedCall(80, () => {
-      if (this.scene.isActive()) this.scale.refresh();
-    });
+    bindViewportRefresh(this);
 
     // Phaser destroys non-main cameras on scene shutdown but the references
     // on `this` persist - null them out so setupCameras() builds fresh ones
@@ -5298,25 +5322,7 @@ class BossScene extends Phaser.Scene {
     // this, holding the joystick blocks taps on ability slots.
     this.input.addPointer(2);
 
-    // Same iOS chrome-resize keeper as GameScene - see the comment there
-    // for why this matters. Boss fight is especially tap-heavy so any
-    // pointer drift is immediately noticeable on hold-to-channel Hydra.
-    // pageshow catches the bfcache restore path (user backgrounded Safari
-    // and tabbed back) which doesn't fire resize/orientationchange.
-    this._touchRefreshHandler = () => this.scale.refresh();
-    window.addEventListener('resize', this._touchRefreshHandler);
-    window.addEventListener('orientationchange', this._touchRefreshHandler);
-    window.addEventListener('pageshow', this._touchRefreshHandler);
-    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
-      window.removeEventListener('resize', this._touchRefreshHandler);
-      window.removeEventListener('orientationchange', this._touchRefreshHandler);
-      window.removeEventListener('pageshow', this._touchRefreshHandler);
-    });
-    // Defensive late refresh in case orientationchange fires before iOS
-    // Safari has finished settling the visible viewport.
-    this.time.delayedCall(80, () => {
-      if (this.scene.isActive()) this.scale.refresh();
-    });
+    bindViewportRefresh(this);
 
     // Same camera-reset prologue as GameScene so scene restarts (death loop)
     // don't leave stale skyCamera / uiCamera references behind.
