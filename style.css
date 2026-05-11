@@ -24,6 +24,14 @@ html, body {
  * the user's finger actually was. The most visible symptom was the JUMP
  * button only registering taps from its upper-left quadrant on iPad.
  *
+ * IMPORTANT: We deliberately do NOT use display:flex / align-items / max-*
+ * here. Phaser's Scale.FIT + autoCenter:CENTER_BOTH already sizes and
+ * centers the canvas via inline styles + margin:auto. Adding flex layout
+ * on top of that creates two layout systems competing for the canvas size
+ * and produces an oval JUMP button (canvas stretched non-uniformly) plus
+ * a stale pointer-bounds rect (taps register offset from where the user
+ * tapped). Let Phaser fully own the canvas sizing.
+ *
  * 100svh / 100lvh are siblings of 100dvh; we use the dynamic value so
  * the container resizes smoothly when chrome shows/hides. */
 #game-container {
@@ -33,15 +41,10 @@ html, body {
   width: 100dvw;
   height: 100vh;
   height: 100dvh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 
 #game-container canvas {
   display: block;
-  max-width: 100%;
-  max-height: 100%;
 }
 
 noscript {

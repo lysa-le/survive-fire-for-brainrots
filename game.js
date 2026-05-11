@@ -1082,15 +1082,32 @@ class GameScene extends Phaser.Scene {
     // interacts. When that happens the visual viewport changes size but
     // Phaser's cached canvas-bounding-rect doesn't auto-update - so touch
     // coordinates start landing in the wrong spot. Listening to window
-    // resize + orientationchange and forcing a Scale.refresh() keeps
-    // pointer math in sync. Cleanup on shutdown so we don't leak listeners
-    // between scene transitions.
+    // resize + orientationchange + pageshow and forcing a Scale.refresh()
+    // keeps pointer math in sync.
+    //
+    // pageshow specifically catches the bfcache restore path: when the user
+    // backgrounds Safari and returns, the page resumes from the back-forward
+    // cache and resize/orientationchange may not fire. Without this hook,
+    // the canvas snapped back to a smaller frame and taps registered way
+    // off-target until the next manual refresh.
+    //
+    // Cleanup on SHUTDOWN so we don't leak listeners between scene
+    // transitions.
     this._touchRefreshHandler = () => this.scale.refresh();
     window.addEventListener('resize', this._touchRefreshHandler);
     window.addEventListener('orientationchange', this._touchRefreshHandler);
+    window.addEventListener('pageshow', this._touchRefreshHandler);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       window.removeEventListener('resize', this._touchRefreshHandler);
       window.removeEventListener('orientationchange', this._touchRefreshHandler);
+      window.removeEventListener('pageshow', this._touchRefreshHandler);
+    });
+    // Defensive late refresh: iOS Safari sometimes fires orientationchange
+    // *before* layout has settled, so the dimensions Phaser reads in its
+    // first scale pass are stale. A single delayed refresh (~80 ms) catches
+    // anything that arrived mid-flight without slowing scene start.
+    this.time.delayedCall(80, () => {
+      if (this.scene.isActive()) this.scale.refresh();
     });
 
     // Phaser destroys non-main cameras on scene shutdown but the references
@@ -5162,12 +5179,21 @@ class BossScene extends Phaser.Scene {
     // Same iOS chrome-resize keeper as GameScene - see the comment there
     // for why this matters. Boss fight is especially tap-heavy so any
     // pointer drift is immediately noticeable on hold-to-channel Hydra.
+    // pageshow catches the bfcache restore path (user backgrounded Safari
+    // and tabbed back) which doesn't fire resize/orientationchange.
     this._touchRefreshHandler = () => this.scale.refresh();
     window.addEventListener('resize', this._touchRefreshHandler);
     window.addEventListener('orientationchange', this._touchRefreshHandler);
+    window.addEventListener('pageshow', this._touchRefreshHandler);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       window.removeEventListener('resize', this._touchRefreshHandler);
       window.removeEventListener('orientationchange', this._touchRefreshHandler);
+      window.removeEventListener('pageshow', this._touchRefreshHandler);
+    });
+    // Defensive late refresh in case orientationchange fires before iOS
+    // Safari has finished settling the visible viewport.
+    this.time.delayedCall(80, () => {
+      if (this.scene.isActive()) this.scale.refresh();
     });
 
     // Same camera-reset prologue as GameScene so scene restarts (death loop)
