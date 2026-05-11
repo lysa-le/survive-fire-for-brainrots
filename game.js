@@ -1290,14 +1290,19 @@ class TitleScene extends Phaser.Scene {
     this.input.keyboard.once('keydown-ENTER', () => launchIfUnlocked(1));
     // Number key launches that level. Shift + number opens the level-complete
     // MODAL preview without playing the level - dev convenience for tuning
-    // the win banner copy / layout.
-    const launchModalPreview = (levelId) => {
+    // the win banner copy / layout. Two preview flavors:
+    //   Shift + N        → first-clear layout (saved line + 2 buttons)
+    //   Shift + Alt + N  → replay layout (single "Back to main", no saved line)
+    const launchModalPreview = (levelId, mode) => {
       Sfx.init(); Sfx.resume(); Sfx.play('portal');
-      this.scene.start('Game', { levelId, previewModal: true });
+      this.scene.start('Game', { levelId, previewModal: true, previewMode: mode });
     };
     const numberHandler = (id) => (e) => {
-      if (e?.shiftKey) launchModalPreview(id);
-      else launch(id);
+      if (e?.shiftKey) {
+        launchModalPreview(id, e.altKey ? 'replay' : 'first-clear');
+      } else {
+        launch(id);
+      }
     };
     this.input.keyboard.on('keydown-ONE',   numberHandler(1));
     this.input.keyboard.on('keydown-TWO',   numberHandler(2));
@@ -1327,7 +1332,7 @@ class TitleScene extends Phaser.Scene {
     // for family members who'll never use these shortcuts.
     if (DEV_MODE) {
       this.add.text(W - 8, H - 4,
-        'dev: Shift+1/2/3/4 to preview win modal · B for boss · clear save: localStorage.removeItem("'
+        'dev: Shift+1..4 first-clear modal · Alt+Shift+1..4 replay modal · B boss · clear save: localStorage.removeItem("'
           + SAVE_KEY + '")',
         { fontFamily: 'system-ui', fontSize: '9px', color: '#5a4f6a' }
       ).setOrigin(1, 1);
@@ -1375,8 +1380,11 @@ class GameScene extends Phaser.Scene {
     this.allDeposited = data?.allDeposited ?? [];
     // Dev preview flag: when true, skip straight to the level-complete modal
     // without playing the level. "Proceed" returns to the title screen so the
-    // user can flip through every level's modal in seconds.
+    // user can flip through every level's modal in seconds. previewMode picks
+    // which layout to show: 'first-clear' (default) renders saved-line + two
+    // buttons; 'replay' renders single "Back to main" with replay copy.
     this.isModalPreview = data?.previewModal === true;
+    this.previewMode = this.isModalPreview ? (data?.previewMode || 'first-clear') : null;
 
     this.cameras.main.setBackgroundColor(this.levelConfig.bg);
     this.physics.world.setBounds(0, 0, WORLD_W, WORLD_H);
@@ -5176,50 +5184,60 @@ class GameScene extends Phaser.Scene {
     if (ultimateId && !cumulative.includes(ultimateId)) cumulative.push(ultimateId);
     const ultimate = ultimateId ? BRAINROT_REGISTRY[ultimateId] : null;
 
-    // Replay detection: if the player has already cleared this level (or
-    // a higher one) before, this run is a replay. We still show a
-    // celebration modal but with alternate "already in your collection"
-    // copy and a single back-to-title button - no progression decision
-    // needed since they're not unlocking anything new.
-    //
-    // Modal-preview launches always take the first-clear path so we can
-    // tune that copy without persistent state interfering.
+    // Replay detection. Two ways a run can show the replay-flavored modal:
+    //   1. Real replay: player already cleared this level (or higher) before.
+    //   2. Preview replay: dev held Alt+Shift+N on title to preview the
+    //      replay layout (single back button, "CLEARED AGAIN" copy).
+    // First-clear previews (Shift+N without Alt) deliberately render the
+    // first-clear layout so devs can review the celebratory copy + the new
+    // two-button row + saved-line.
     const saveBefore = SaveState.read();
-    const isReplay = !this.isModalPreview && this.levelId <= saveBefore.lastClearedLevel;
+    const realReplay = this.levelId <= saveBefore.lastClearedLevel;
+    const previewReplay = this.isModalPreview && this.previewMode === 'replay';
+    const isReplay = previewReplay || (!this.isModalPreview && realReplay);
 
-    // Decide where to route on "Proceed". L1-L3 → next level. L4 → BossScene
-    // if the player has all four ultimates (the regular completion path);
-    // otherwise → WinScene roster (only happens for cheat-jumped runs).
-    // Replays always route back to the Title so the player can pick the
-    // next thing they want to revisit.
+    // Decide where the right-button (or the single Back button) routes.
+    // Real plays use the regular forward routes (Game / Boss / Win); preview
+    // runs always collapse to Title so a dev can flip between modals
+    // without re-launching the level. Replay runs (real or previewed) only
+    // ever surface a single Back-to-main button, so they always route Title.
     let nextRoute, nextPayload, nextButtonLabel;
-    if (this.isModalPreview) {
-      // Preview mode: return to title so the dev can flip through every
-      // level's modal in seconds.
-      nextRoute = 'Title';
-      nextPayload = {};
-      nextButtonLabel = '⟵ Back to Title';
-    } else if (isReplay) {
+    if (isReplay) {
       nextRoute = 'Title';
       nextPayload = {};
       nextButtonLabel = '⟵ Back to Title';
     } else if (LEVELS[nextLevelId]) {
-      nextRoute = 'Game';
-      nextPayload = { levelId: nextLevelId, allDeposited: cumulative };
       nextButtonLabel = `Proceed to Level ${nextLevelId}`;
+      if (this.isModalPreview) {
+        nextRoute = 'Title';
+        nextPayload = {};
+      } else {
+        nextRoute = 'Game';
+        nextPayload = { levelId: nextLevelId, allDeposited: cumulative };
+      }
     } else {
       const requiredUltimates = Object.values(LEVELS)
         .map((lv) => lv.ultimateId)
         .filter(Boolean);
       const allUltimatesCollected = requiredUltimates.every((id) => cumulative.includes(id));
       if (allUltimatesCollected) {
-        nextRoute = 'Boss';
-        nextPayload = { allDeposited: cumulative };
         nextButtonLabel = 'Enter the Final Battle ⚡';
+        if (this.isModalPreview) {
+          nextRoute = 'Title';
+          nextPayload = {};
+        } else {
+          nextRoute = 'Boss';
+          nextPayload = { allDeposited: cumulative };
+        }
       } else {
-        nextRoute = 'Win';
-        nextPayload = { allDeposited: cumulative };
         nextButtonLabel = 'View Roster';
+        if (this.isModalPreview) {
+          nextRoute = 'Title';
+          nextPayload = {};
+        } else {
+          nextRoute = 'Win';
+          nextPayload = { allDeposited: cumulative };
+        }
       }
     }
 
@@ -5377,22 +5395,23 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // Buttons. Two layouts based on whether there's a forward CTA:
-    //   - First-clear runs that advance progression have a forward action
-    //     (Proceed to Level X / Enter the Final Battle / View Roster) on
-    //     the right + a secondary "Back to main" on the left.
-    //   - Replay + modal-preview runs only get "Back to main" centered;
-    //     there's no forward target to offer because nextRoute is already
-    //     'Title' for those paths.
+    // Buttons. Layout is driven by isReplay (not nextRoute) so that
+    // dev modal previews still get to render the new first-clear layout
+    // even though their right-button routes back to Title under the hood.
+    //   - First-clear runs (or first-clear previews) get a secondary
+    //     "Back to main" on the left + the primary forward CTA on the
+    //     right (Proceed to Level X / Enter the Final Battle / View Roster).
+    //   - Replay runs (or replay previews) get a single centered
+    //     "Back to main" - no forward target to offer.
     const btnH = 54;
     const btnY = cardY + cardH / 2 - 50;
-    const isSingleBtn = nextRoute === 'Title';
+    const isSingleBtn = isReplay;
 
     // "Your progress is saved." reassurance line. Sits ~22 px above the
-    // button row. Only rendered on first-clear runs - a replay didn't
-    // persist anything new this run, and modal previews never write to
-    // save, so the line would be misleading on those paths.
-    if (!isReplay && !this.isModalPreview) {
+    // button row. Rendered on first-clear runs (real or previewed). Real
+    // replays didn't write to save this run, so the line would be
+    // misleading there - it's suppressed via the isReplay guard.
+    if (!isReplay) {
       add(this.add.text(cardX, btnY - btnH / 2 - 22,
         'Your progress is saved.', {
         fontFamily: 'system-ui, sans-serif',
