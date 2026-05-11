@@ -992,11 +992,10 @@ class TitleScene extends Phaser.Scene {
     this.input.keyboard.on('keydown-THREE', numberHandler(3));
     this.input.keyboard.on('keydown-FOUR',  numberHandler(4));
 
-    // Hidden dev shortcut: press B to jump straight into the Los Hackers
-    // boss arena with all four ultimates pre-unlocked. Not surfaced in the
-    // UI - the boss is meant to be progression-gated through L1->L4 - but
-    // this saves a long replay loop while building / testing the fight.
-    this.input.keyboard.on('keydown-B', () => {
+    // Dev shortcut: jump straight into the Los Hackers boss arena with all
+    // four ultimates pre-unlocked. Not part of the canonical L1->L4 flow,
+    // just a way to skip the replay loop while testing the fight.
+    const launchBossTest = () => {
       Sfx.init(); Sfx.resume(); Sfx.play('portal');
       const allUltimates = Object.values(LEVELS)
         .map((lv) => lv.ultimateId)
@@ -1008,7 +1007,43 @@ class TitleScene extends Phaser.Scene {
       this.scene.start('Boss', {
         allDeposited: [...new Set([...allUltimates, ...allBrainrots])],
       });
-    });
+    };
+    this.input.keyboard.on('keydown-B', launchBossTest);
+
+    // TEMPORARY: dev shortcut to the boss fight, touch-friendly version
+    // of keydown-B. The keyboard shortcut isn't reachable on iPad / iPhone,
+    // so this pill button surfaces it in the UI. When persistent progress
+    // lands (see GAME_SPEC_DESCOPED.md §20), this button gets repurposed:
+    // visible only when lastClearedLevel >= 4, hidden otherwise. Search for
+    // "TEMPORARY: dev shortcut to the boss fight" to find the removal site.
+    const bossBtnW = 152;
+    const bossBtnH = 32;
+    const bossBtn = this.add.container(W - 92, H - 52);
+    const bossBg = this.add.graphics();
+    bossBg.fillStyle(0x1a0f1f, 0.88);
+    bossBg.fillRoundedRect(-bossBtnW / 2, -bossBtnH / 2, bossBtnW, bossBtnH, 14);
+    bossBg.lineStyle(2, 0xff4a18, 0.75);
+    bossBg.strokeRoundedRect(-bossBtnW / 2, -bossBtnH / 2, bossBtnW, bossBtnH, 14);
+    const bossLabel = this.add.text(0, 0, '⚡ BOSS (dev)', {
+      fontFamily: 'Impact, Charcoal, sans-serif',
+      fontSize: '15px', color: '#ffb066',
+    }).setOrigin(0.5);
+    bossBtn.add([bossBg, bossLabel]);
+    // Hit area is ~24 px taller / wider than the visible pill so big thumbs
+    // can land it comfortably without the button needing to look bigger.
+    bossBtn.setSize(bossBtnW + 24, bossBtnH + 24);
+    bossBtn.setInteractive(
+      new Phaser.Geom.Rectangle(
+        -(bossBtnW + 24) / 2,
+        -(bossBtnH + 24) / 2,
+        bossBtnW + 24,
+        bossBtnH + 24,
+      ),
+      Phaser.Geom.Rectangle.Contains,
+    );
+    bossBtn.on('pointerdown', launchBossTest);
+    bossBtn.on('pointerover', () => bossLabel.setColor('#ffe066'));
+    bossBtn.on('pointerout',  () => bossLabel.setColor('#ffb066'));
 
     this.add.text(W / 2, H - 16,
       'WASD / arrows to move on desktop - drag the left side on mobile',
@@ -1018,7 +1053,7 @@ class TitleScene extends Phaser.Scene {
     // Tiny dev hint, deliberately small + low-contrast so it doesn't compete
     // with the level buttons but is discoverable for review purposes.
     this.add.text(W - 8, H - 4,
-      'dev: Shift+1/2/3/4 to preview win modal · B to test boss',
+      'dev: Shift+1/2/3/4 to preview win modal · B / pill button to test boss',
       { fontFamily: 'system-ui', fontSize: '10px', color: '#5a4f6a' }
     ).setOrigin(1, 1);
   }
@@ -1042,6 +1077,21 @@ class GameScene extends Phaser.Scene {
     // button (or two buttons) simultaneously. Critical for L4 pillar-to-
     // pillar jumps which require movement + jump in the same instant.
     this.input.addPointer(2);
+
+    // iOS Safari shows / hides its URL bar dynamically as the user
+    // interacts. When that happens the visual viewport changes size but
+    // Phaser's cached canvas-bounding-rect doesn't auto-update - so touch
+    // coordinates start landing in the wrong spot. Listening to window
+    // resize + orientationchange and forcing a Scale.refresh() keeps
+    // pointer math in sync. Cleanup on shutdown so we don't leak listeners
+    // between scene transitions.
+    this._touchRefreshHandler = () => this.scale.refresh();
+    window.addEventListener('resize', this._touchRefreshHandler);
+    window.addEventListener('orientationchange', this._touchRefreshHandler);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      window.removeEventListener('resize', this._touchRefreshHandler);
+      window.removeEventListener('orientationchange', this._touchRefreshHandler);
+    });
 
     // Phaser destroys non-main cameras on scene shutdown but the references
     // on `this` persist - null them out so setupCameras() builds fresh ones
@@ -5108,6 +5158,17 @@ class BossScene extends Phaser.Scene {
     // ability buttons + a virtual joystick + hold-to-channel Hydra. Without
     // this, holding the joystick blocks taps on ability slots.
     this.input.addPointer(2);
+
+    // Same iOS chrome-resize keeper as GameScene - see the comment there
+    // for why this matters. Boss fight is especially tap-heavy so any
+    // pointer drift is immediately noticeable on hold-to-channel Hydra.
+    this._touchRefreshHandler = () => this.scale.refresh();
+    window.addEventListener('resize', this._touchRefreshHandler);
+    window.addEventListener('orientationchange', this._touchRefreshHandler);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      window.removeEventListener('resize', this._touchRefreshHandler);
+      window.removeEventListener('orientationchange', this._touchRefreshHandler);
+    });
 
     // Same camera-reset prologue as GameScene so scene restarts (death loop)
     // don't leave stale skyCamera / uiCamera references behind.

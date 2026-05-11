@@ -13,9 +13,26 @@ html, body {
   touch-action: none;
 }
 
+/* The container is anchored to the visible viewport (position: fixed +
+ * inset: 0) so it never grows taller than the actual on-screen area.
+ *
+ * 100dvh (dynamic viewport height) instead of 100vh keeps it correct on
+ * iOS Safari, where 100vh is the *largest possible* viewport (chrome
+ * fully retracted) - that mismatch was shifting the canvas off the
+ * visible area when the URL bar was showing, which in turn made every
+ * touch coordinate Phaser computed land slightly down-and-right of where
+ * the user's finger actually was. The most visible symptom was the JUMP
+ * button only registering taps from its upper-left quadrant on iPad.
+ *
+ * 100svh / 100lvh are siblings of 100dvh; we use the dynamic value so
+ * the container resizes smoothly when chrome shows/hides. */
 #game-container {
+  position: fixed;
+  inset: 0;
   width: 100vw;
+  width: 100dvw;
   height: 100vh;
+  height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;

@@ -1034,4 +1034,74 @@ This replaces the inline cleanup that lived in v0.6.1b's `enterPhase2` and preve
 
 ---
 
+## 20. Future: persistent progress + level select (NOT YET BUILT)
+
+A backlog item we discussed but deferred. Captured here so it's easy to pick up later.
+
+### 20.1 Why
+
+Today the title screen always launches Level 1, and the player has to clear levels in sequence within a single sitting. If the page is refreshed mid-run, all progress is lost. For family/share-to-relatives mode this is rough; replaying L1 every time you want to test L4 or the boss is also a developer pain.
+
+### 20.2 What we'd build
+
+1. **LocalStorage save state** keyed to a single slot:
+   ```js
+   {
+     lastClearedLevel: 0..4,    // 0 = nothing cleared yet
+     bossDefeated: boolean,
+     unlockedUltimates: string[],   // mirrors current in-memory state
+     lastUpdatedAt: number,
+   }
+   ```
+   Read on `TitleScene.create()`, written on level-complete modal "Proceed" and on boss victory.
+2. **Title screen reads this state** and renders all 4 level buttons + a Boss button conditionally:
+   - Locked levels (`id > lastClearedLevel + 1`) appear dimmed and non-tappable, possibly with a small lock icon.
+   - Cleared levels stay tappable for replay (so a player who got stuck on L3 can revisit L1 for fun).
+   - Boss button only appears once `lastClearedLevel >= 4`.
+3. **Reset progress button** somewhere unobtrusive (e.g. tiny "↻ reset" link at the bottom of the title screen) so dev / family members can clear state without opening DevTools.
+4. **Resume vs replay UX**: when a level is replayed, prior `allDeposited` is loaded from save state (so previously-collected ultimates stay unlocked in the ability bar). The replay itself doesn't re-grant rewards.
+
+### 20.3 What changes about the dev Boss button
+
+The temporary "⚡ BOSS (dev)" pill button shipped in v0.6.1d (see §21) is a stand-in for the real Boss button. When persistent progress lands, that button gets repurposed:
+- Visible when `lastClearedLevel >= 4` (real progression).
+- Hidden otherwise (no more dev pill on the title screen).
+
+The grep marker `// TEMPORARY: dev shortcut to the boss fight.` in `TitleScene.create()` is the find-and-remove anchor.
+
+### 20.4 Open design questions
+
+- Multiple save slots? (Probably no — keep it simple, single slot per browser).
+- Cloud sync? (Definitely no for the descoped build).
+- How to handle a save that references brainrots / ultimates that no longer exist after a roster refresh? (Probably defensive filter on read: drop unknown ids, log a console warning).
+
+---
+
+## 21. v0.6.1d — Touch UX hardening
+
+A small but important fix pass after testing on iPad / iPhone via the live GitHub Pages URL surfaced three issues at once. Shipped together because they share a root cause (CSS viewport math) and the dev workflow.
+
+### 21.1 Jump button hit area was offset on iOS
+
+**Symptom:** "Tapping the JUMP button center doesn't register, but tapping the upper-left works." Player had to physically aim above-and-left of the visible button.
+
+**Root cause:** `#game-container { height: 100vh; }` in `style.css`. iOS Safari's `100vh` is the **largest** possible viewport (when browser chrome is auto-hidden), not the **current** viewport. With `align-items: center` flexbox, the canvas was centered in a container taller than the visible area, so its on-screen position didn't match what `getBoundingClientRect()` reported. Phaser's pointer-coord translation used the stale rect, shifting all touch coords.
+
+**Fix:**
+1. `style.css`: `100vh` → `100dvh`, plus `position: fixed; inset: 0` on `#game-container` so it always anchors to the visible viewport regardless of chrome state.
+2. `index.html`: added `viewport-fit=cover` to the viewport meta so future safe-area work has a clean slate.
+3. `game.js`: in both `GameScene.create()` and `BossScene.create()`, listen for `window` `resize` + `orientationchange` and call `this.scale.refresh()`. Cleanup on scene `SHUTDOWN`. Eliminates stale-bounds drift when iOS Safari chrome shows / hides mid-play.
+
+### 21.2 "BOSS (dev)" temporary title-screen button
+
+**Symptom:** Touch devices have no keyboard, so the existing `keydown-B` shortcut on the title screen was unreachable. Replaying L1→L4 every time you want to test the boss is brutal on iPad.
+
+**Fix:** Added a small dim pill button in the bottom-right of the title screen labeled `⚡ BOSS (dev)` with the same payload as the keyboard shortcut (all 4 ultimates pre-unlocked, all collectible brainrots stitched in for the WinScene roster). Tagged with a `// TEMPORARY:` comment so it's trivial to find and remove once persistent progress (§20) lands and the real Boss button takes over.
+
+### 21.3 Why this slice was small but worth a section
+
+The hit-offset bug had been silently degrading touch input for the entire iPad playtest. Once it's fixed, every other touch button feels meaningfully more responsive (not just JUMP). Future touch work (haptics, sound feedback, etc.) should assume this fix is in place; without it, no amount of button polish would have helped.
+
+---
+
 *End of GAME_SPEC_DESCOPED.md*
