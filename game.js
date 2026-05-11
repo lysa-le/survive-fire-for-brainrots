@@ -7916,24 +7916,72 @@ class WinScene extends Phaser.Scene {
       }).setOrigin(0.5);
 
     /* ----- Continue / reset buttons -----
-     * Boss-cleared runs see two actions: a prominent "KEEP PLAYING"
-     * primary that returns to Title with the save intact (the default,
-     * stylistically and via SPACE/ENTER), plus a small dim "Start over"
-     * link that clears the save after a tap-twice confirmation.
+     * Boss-cleared runs see two side-by-side CTAs: a destructive
+     * "Start over" (secondary, tap-twice-to-confirm) on the left, and a
+     * primary "Keep playing" on the right that returns to Title with
+     * the save intact (default action, also bound to SPACE/ENTER).
      *
      * Non-boss runs (cheat-jumped to WinScene without beating Los
-     * Hackers) only see the primary button and it's labeled "PLAY AGAIN"
-     * to keep the original feel of "this is just a roster preview screen,
-     * go play the real game". That path doesn't need a reset prompt
-     * because no progression was earned. */
-    const primaryLabel = bossDefeated ? '↻  KEEP PLAYING' : '↻  PLAY AGAIN';
-    const btn = this.add.text(W / 2, H * 0.91, primaryLabel, {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '22px', color: '#1a0f1f',
-      backgroundColor: '#ffe066',
-      padding: { x: 22, y: 9 },
-    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
-    this.tweens.add({ targets: btn, scale: 1.05, duration: 700, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+     * Hackers) only see the primary button labeled "PLAY AGAIN" to keep
+     * the original "this is just a roster preview, go play the real
+     * game" feel. That path doesn't need a reset prompt because no
+     * progression was earned. */
+
+    // makeWinButton mirrors the level-complete modal button styling so
+    // the two screens feel consistent. Primary = purple-with-gold-on-
+    // hover pill; secondary = dim outlined pill that lifts to gold on
+    // hover. Returns an object with .setLabel/.setPrimary/.setMode so
+    // tap-twice-to-confirm on Start over can swap the visual state.
+    const makeWinButton = ({ x, y, w, h, label, primary, onClick }) => {
+      let isPrimary = primary;
+      let isWarning = false;
+      const bg = this.add.graphics();
+      const draw = (hover) => {
+        bg.clear();
+        if (isWarning) {
+          // Armed-confirm state: red fill + ring so the player can't
+          // miss that the next tap is destructive.
+          bg.fillStyle(hover ? 0x6e1f1f : 0x4f1717, 0.95);
+          bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+          bg.lineStyle(3, 0xff7a7a, 1.0);
+          bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+        } else if (isPrimary) {
+          bg.fillStyle(hover ? 0x4a3f6a : 0x32254a, 0.95);
+          bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+          bg.lineStyle(3, hover ? 0xffe066 : 0xcbb3ff, 1.0);
+          bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+        } else {
+          bg.fillStyle(0x1a0f1f, 0.65);
+          bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+          bg.lineStyle(2, hover ? 0xcbb3ff : 0x6a4f6a, 1.0);
+          bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+        }
+      };
+      draw(false);
+      const text = this.add.text(x, y, label, {
+        fontFamily: 'Impact, Charcoal, sans-serif',
+        fontSize: primary ? '22px' : '19px',
+        color: primary ? '#ffffff' : '#cbb3ff',
+        stroke: '#1a0f1f', strokeThickness: 3,
+        letterSpacing: 1,
+      }).setOrigin(0.5);
+      const hit = this.add.rectangle(x, y, w, h, 0x000000, 0.001);
+      hit.setInteractive({ useHandCursor: true });
+      hit.on('pointerover', () => {
+        draw(true);
+        if (!isPrimary && !isWarning) text.setColor('#ffe066');
+      });
+      hit.on('pointerout', () => {
+        draw(false);
+        if (!isPrimary && !isWarning) text.setColor('#cbb3ff');
+      });
+      hit.on('pointerdown', onClick);
+      return {
+        setLabel: (s) => text.setText(s),
+        setColor: (c) => text.setColor(c),
+        setWarning: (on) => { isWarning = on; draw(false); },
+      };
+    };
 
     // Boss-cleared default: head back to title and let the player pick
     // what to revisit (all 5 pills now unlocked in prod mode). Non-boss
@@ -7943,52 +7991,84 @@ class WinScene extends Phaser.Scene {
       if (bossDefeated) this.scene.start('Title');
       else this.scene.start('Game', { levelId: 1 });
     };
-    btn.on('pointerdown', primaryAction);
+
+    if (bossDefeated) {
+      // Two-button row, centered. Mirrors the level-complete modal
+      // proportions (200 px each, 14 px gap = 414 px total) so the
+      // visual rhythm carries across both endings.
+      const btnY = H * 0.92;
+      const btnH = 54;
+      const sideW = 200;
+      const gap = 14;
+      const totalW = sideW * 2 + gap;
+      const leftX = W / 2 - totalW / 2 + sideW / 2;
+      const rightX = W / 2 + totalW / 2 - sideW / 2;
+
+      // Tap-twice-to-confirm Start over. State machine:
+      //   idle -> '\u21BA  Start over' (purple secondary)
+      //   armed -> 'Tap again to start over' (red warning)
+      //   confirmed -> SaveState.reset(); back to Title
+      // Idle reverts after 5 s if the second tap never lands so an
+      // accidental first tap can't sit armed forever.
+      let armed = false;
+      let armTimer = null;
+      let resetBtn;
+      const disarm = () => {
+        armed = false;
+        resetBtn.setLabel('\u21BA  Start over');
+        resetBtn.setWarning(false);
+        if (armTimer) { armTimer.remove(false); armTimer = null; }
+      };
+      resetBtn = makeWinButton({
+        x: leftX, y: btnY, w: sideW, h: btnH,
+        label: '\u21BA  Start over',
+        primary: false,
+        onClick: () => {
+          if (!armed) {
+            armed = true;
+            resetBtn.setLabel('Tap again to confirm');
+            resetBtn.setColor('#ffd6d6');
+            resetBtn.setWarning(true);
+            armTimer = this.time.delayedCall(5000, disarm);
+            return;
+          }
+          if (armTimer) { armTimer.remove(false); armTimer = null; }
+          SaveState.reset();
+          this.scene.start('Title');
+        },
+      });
+
+      makeWinButton({
+        x: rightX, y: btnY, w: sideW, h: btnH,
+        label: '\u21BB  Keep playing',
+        primary: true,
+        onClick: primaryAction,
+      });
+    } else {
+      // Cheat-jumped non-boss runs keep the original single PLAY AGAIN
+      // pill - no reset prompt because no progression was earned.
+      const btn = this.add.text(W / 2, H * 0.91, '\u21BB  PLAY AGAIN', {
+        fontFamily: 'system-ui, sans-serif',
+        fontSize: '22px', color: '#1a0f1f',
+        backgroundColor: '#ffe066',
+        padding: { x: 22, y: 9 },
+      }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+      this.tweens.add({
+        targets: btn, scale: 1.05, duration: 700,
+        yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+      });
+      btn.on('pointerdown', primaryAction);
+    }
+
+    // Keyboard fallback - SPACE / ENTER always pick the safe default
+    // (Keep playing on boss path, Play Again on non-boss path). The
+    // destructive Start over CTA is intentionally pointer-only so a
+    // stray keypress can't trigger reset confirmation.
     this.input.keyboard.once('keydown-SPACE', primaryAction);
     this.input.keyboard.once('keydown-ENTER', primaryAction);
 
-    if (bossDefeated) {
-      // Tap-twice-to-confirm reset link. Lives at H * 0.965 as a tertiary
-      // action so it doesn't compete with KEEP PLAYING. The state machine:
-      //   idle -> 'Start over' (cbb3ff)
-      //   armed -> 'Tap again to confirm — this clears your progress' (red)
-      //   confirmed -> SaveState.reset(); back to Title
-      // Idle text reverts after 5s if the second tap never lands, so an
-      // accidental first tap can't sit armed forever.
-      const resetLink = this.add.text(W / 2, H * 0.965, '↺  Start over', {
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: '12px', color: '#cbb3ff',
-        // Padding bakes invisible hit-area slack around the text so the
-        // 12-px label is still comfortably tappable on a phone without
-        // visually competing with the KEEP PLAYING button above.
-        padding: { x: 14, y: 8 },
-      }).setOrigin(0.5).setInteractive({ useHandCursor: true });
-
-      let armed = false;
-      let armTimer = null;
-      const disarm = () => {
-        armed = false;
-        resetLink.setText('↺  Start over');
-        resetLink.setColor('#cbb3ff');
-        if (armTimer) { armTimer.remove(false); armTimer = null; }
-      };
-      resetLink.on('pointerdown', () => {
-        if (!armed) {
-          armed = true;
-          resetLink.setText('Tap again to confirm — this clears your progress');
-          resetLink.setColor('#ff7a7a');
-          armTimer = this.time.delayedCall(5000, disarm);
-          return;
-        }
-        if (armTimer) { armTimer.remove(false); armTimer = null; }
-        SaveState.reset();
-        this.scene.start('Title');
-      });
-    }
-
-    // Footer thank-you sits one row above the bottom edge to leave room
-    // for the reset link in the boss-cleared path. Looks identical on
-    // non-boss runs; we just shift the y a touch upward.
+    // Footer thank-you. y = H - 4 leaves a clean 1 px gutter above the
+    // bottom edge regardless of the button row height above it.
     this.add.text(W / 2, H - 4, 'Survive Fire for Brainrots - thanks for playing!', {
       fontFamily: 'system-ui, sans-serif',
       fontSize: '10px', color: '#666666',

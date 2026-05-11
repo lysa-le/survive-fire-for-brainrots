@@ -1222,8 +1222,9 @@ The "Your progress is saved." line is `12 px` system-italic in the same dusty-pu
 After defeating Los Hackers, `BossScene.handleVictory()` writes `bossDefeated: true` to save and routes to WinScene as before. WinScene now branches on `bossDefeated`:
 
 **Boss path (`bossDefeated === true`):**
-- Primary button: `↻  KEEP PLAYING` (same gold pill as the old PLAY AGAIN, but routes to Title instead of Game-with-levelId-1). Default-highlighted, also bound to SPACE / ENTER. With save intact, all 5 pills are unlocked on Title.
-- Secondary "↺ Start over" link below the primary, dim purple. **Tap-twice-to-confirm:** first tap morphs the link into red text `Tap again to confirm — this clears your progress`; second tap calls `SaveState.reset()` and routes to Title. If the second tap doesn't land within 5 seconds, the link reverts to its idle copy so an accidental first tap can't sit armed forever.
+- Two side-by-side CTAs centered at `H * 0.92`, sharing the same proportions as the level-complete modal button row (200 px each, 14 px gap):
+  - **Left — `↺  Start over` (secondary):** dim outlined pill, gold-on-hover. **Tap-twice-to-confirm:** first tap morphs the button into a red-warning state with `Tap again to confirm`; second tap calls `SaveState.reset()` and routes to Title. If the second tap doesn't land within 5 seconds, the button reverts to its idle copy so an accidental first tap can't sit armed forever. Pointer-only — no keyboard binding so a stray keypress can't trigger destructive flow.
+  - **Right — `↻  Keep playing` (primary):** purple-with-gold-on-hover pill matching the level-complete primary CTA. Routes to Title with save intact (all 5 pills unlocked in prod mode). Also bound to SPACE / ENTER as the safe default.
 
 **Non-boss path (`bossDefeated !== true`):**
 - Cheat-jumped runs that reached WinScene without a boss kill keep the original single `↻ PLAY AGAIN` button that drops back to Game with `levelId: 1`. No reset link — there's no progression earned to reset.
