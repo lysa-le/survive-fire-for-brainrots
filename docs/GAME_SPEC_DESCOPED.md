@@ -1,7 +1,7 @@
 # Survive Fire for Brainrots — Descoped Spec (1-Day Web Build)
 
-**Version**: 0.6.1c (Boss fight — Phase 3 + Ring Pulse + Hydra Beam + Drones)
-**Last updated**: 2026-05-10
+**Version**: 0.6.1e (Touch hit-test rebuild + shake coalescing)
+**Last updated**: 2026-05-11
 **Status**: Active build target
 **Relation to north star**: This is a *radically descoped* version of [`GAME_SPEC.md`](./GAME_SPEC.md). The original full-fidelity spec remains the long-term north star. This document defines what we're actually building **today** in a single-day, $0 budget web prototype.
 
@@ -1101,6 +1101,40 @@ A small but important fix pass after testing on iPad / iPhone via the live GitHu
 ### 21.3 Why this slice was small but worth a section
 
 The hit-offset bug had been silently degrading touch input for the entire iPad playtest. Once it's fixed, every other touch button feels meaningfully more responsive (not just JUMP). Future touch work (haptics, sound feedback, etc.) should assume this fix is in place; without it, no amount of button polish would have helped.
+
+---
+
+## 22. v0.6.1e — Touch hit-test rebuild + shake coalescing
+
+After 21.x shipped, iPad playtest still showed JUMP button taps registering left of the visible button. The CSS / `pageshow` work fixed canvas-DOM-bounds drift, but **not** the underlying camera-zoom mismatch — turns out there were two independent bugs producing the same symptom.
+
+### 22.1 Touch buttons: from `setInteractive` to a manual hit-test registry
+
+**Root cause (the second one):** GameScene and BossScene both run three cameras — `skyCamera` + `cameras.main` (zoom 1.6) + `uiCamera` (zoom 1) — and HUD buttons live on the uiCamera via `setScrollFactor(0)` + `cameras.main.ignore(button)`. Visually that works (button renders crisply through uiCamera). But Phaser's input plugin still iterates the camera list and runs hit-test transforms; the zoom on `cameras.main` was leaking into the hit math for screen-locked containers and offsetting the hit zone relative to the visible ring. Reproducing the exact internals would have been fragile (it changes between Phaser minor versions), so we routed around the problem entirely.
+
+**Fix:** new `TouchButtonRegistry` class. One global `pointerdown` listener per scene compares `pointer.x / pointer.y` (which Phaser always reports in canvas-pixel space, already inverse of `Scale.FIT`) against an in-memory list of `{ x, y, shape, hitR | w, h, onTap, onRelease? }` entries. Hits dispatch `onTap` immediately. For hold-to-channel slots (Hydra), the registry tracks `pointer.id → button` until release, so `onRelease` only fires for releases that started on that button — same semantics as the old gameObject-bound `pointerup` / `pointerupoutside` pair, but with no Phaser camera transform involved.
+
+**Coverage:**
+- GameScene: JUMP button (one entry, circle at `(GAME_W - 70, GAME_H - 70)` r=64).
+- BossScene: 4 ability slots (Lirili / Bombardiro / Capitano / Hydra). Hydra registers an `onRelease` for hold-to-channel.
+- TitleScene: not migrated — it has no zoomed gameplay camera, so the bug doesn't apply there. Level-select pills + `⚡ BOSS (dev)` keep their existing `setInteractive` so `pointerover` / `pointerout` hover effects still work on desktop.
+
+**Joystick coexistence:** the `VirtualJoystick`'s `onDown` now first calls `this.scene.touchButtons?.contains(p)` and bails out if the tap landed on a registered button. Critical for slot 4 (Hydra) at x≈442, which sits inside the joystick's left-60% drag region — without this, a hold-to-channel tap would also drag the player.
+
+### 22.2 Camera shake on Levels 2 and 4
+
+**Symptom:** "Reduce shake impact on level 2 and level 4." Meteor salvos and clustered geyser eruptions were stacking shakes on top of each other every ~150 ms, producing a continuous head-rattle rather than discrete impact thumps.
+
+**Fix:**
+- Halved the magnitudes of the two spammy hazards: meteor impact `(120, 0.005)` → `(80, 0.0025)`, geyser eruption `(180, 0.006)` → `(100, 0.003)`.
+- Added `shakeOnce(durationMs, intensity)` helper on GameScene. Tracks `_shakeBusyUntil` and skips if a previously-issued shake is still in-flight, so back-to-back triggers collapse into one continuous shake instead of compounding.
+- Player-hit shake (`onPlayerHit`) and game-over shake stay on `cameras.main.shake()` directly — those are one-time events per trigger and we want them to land at full force.
+
+### 22.3 Things deliberately NOT touched
+
+- **Issue 2 (missing meteor fires on L2)** — known to be a depth-stacking bug (fires render at `-7..-5`, desert decorations at `(y+1)*32`, so cacti / boulders cover them). User chose to defer.
+- **`cameras.main.setZoom(GAME_ZOOM)`** — the zoom is load-bearing for how the world reads visually. Removing it would have been a much bigger blast radius than swapping how the buttons hit-test.
+- **DOM-overlay buttons** — would have lost the integrated Phaser-drawn cooldown ring + gold pulse on the ability slots, plus required absolute-positioning the DOM nodes against the canvas's `Scale.FIT` letterbox after every refresh.
 
 ---
 

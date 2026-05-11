@@ -741,6 +741,84 @@ const Tts = {
 };
 
 /* ============================================================================
+   Touch button registry
+
+   Bypasses Phaser's per-camera input plumbing so HUD buttons hit-test
+   directly in canvas-pixel space. Why we need this: the gameplay scenes
+   run three cameras (skybox / zoomed gameplay / unzoomed UI) and call
+   `cameras.main.setZoom(1.6)`. Even with `setScrollFactor(0)` plus
+   `cameras.main.ignore(button)`, on iPad we observed the visible button
+   ending up offset from its hit zone (taps to the LEFT of the JUMP
+   button were registering as hits, taps in the visible center were not).
+   Reproducing the exact Phaser internals is fragile and varies by
+   version - so instead, every touch button registers a pure
+   x/y/hit-shape entry here, and one global `pointerdown` listener
+   compares pointer.x/pointer.y (which Phaser always reports in
+   canvas-pixel space, already inverse of Scale.FIT) against those
+   entries. No camera transform, no ignore() plumbing, no zoom math.
+
+   Bonus: the registry exposes `contains(pointer)` so the virtual
+   joystick can refuse to start a drag on the same tap that just
+   activated a HUD button (matters for slot 4 / Hydra at x=442, which
+   sits inside the joystick's left-60% drag region).
+   ============================================================================ */
+
+class TouchButtonRegistry {
+  constructor(scene) {
+    this.scene = scene;
+    this.buttons = [];
+    this._heldByPointer = new Map();
+
+    scene.input.on('pointerdown', this._onPointerDown, this);
+    scene.input.on('pointerup', this._onPointerUp, this);
+    scene.input.on('pointerupoutside', this._onPointerUp, this);
+    scene.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      scene.input.off('pointerdown', this._onPointerDown, this);
+      scene.input.off('pointerup', this._onPointerUp, this);
+      scene.input.off('pointerupoutside', this._onPointerUp, this);
+      this.buttons.length = 0;
+      this._heldByPointer.clear();
+    });
+  }
+
+  // def: { x, y, shape: 'circle'|'rect', hitR?, w?, h?, onTap, onRelease? }
+  add(def) { this.buttons.push(def); return def; }
+
+  contains(pointer) {
+    for (const b of this.buttons) {
+      if (this._hit(b, pointer.x, pointer.y)) return true;
+    }
+    return false;
+  }
+
+  _hit(b, x, y) {
+    if (b.shape === 'rect') {
+      return Math.abs(x - b.x) <= b.w / 2 && Math.abs(y - b.y) <= b.h / 2;
+    }
+    const dx = x - b.x;
+    const dy = y - b.y;
+    return (dx * dx + dy * dy) <= b.hitR * b.hitR;
+  }
+
+  _onPointerDown(pointer) {
+    for (const b of this.buttons) {
+      if (this._hit(b, pointer.x, pointer.y)) {
+        b.onTap?.(pointer);
+        if (b.onRelease) this._heldByPointer.set(pointer.id, b);
+        return;
+      }
+    }
+  }
+
+  _onPointerUp(pointer) {
+    const b = this._heldByPointer.get(pointer.id);
+    if (!b) return;
+    this._heldByPointer.delete(pointer.id);
+    b.onRelease(pointer);
+  }
+}
+
+/* ============================================================================
    Virtual joystick (mobile)
    ============================================================================ */
 
@@ -765,6 +843,12 @@ class VirtualJoystick {
   }
   onDown(p) {
     if (this.active) return;
+    // Defer to HUD touch buttons: if this tap landed on JUMP / an ability
+    // slot, don't also start a joystick drag. Slot 4 (Hydra) is at x=442
+    // which is inside the left-60% region, so the registry check is the
+    // only thing keeping a hold-to-channel tap from also yanking the
+    // player around.
+    if (this.scene.touchButtons?.contains(p)) return;
     if (p.x > this.scene.scale.width * 0.6) return;
     this.active = true;
     this.pointerId = p.id;
@@ -1173,6 +1257,13 @@ class GameScene extends Phaser.Scene {
       D: Phaser.Input.Keyboard.KeyCodes.D,
     });
     this.input.keyboard.on('keydown-SPACE', () => this.tryJump(this.time.now));
+    // Touch-button registry MUST be created before VirtualJoystick so the
+    // joystick's onDown can call `this.touchButtons.contains(p)` to skip
+    // taps that landed on a HUD button. Order also matters for listener
+    // dispatch: registry registers its pointerdown listener first, so its
+    // _onPointerDown fires before joystick.onDown - meaning by the time
+    // the joystick checks `contains`, any onTap callbacks have already run.
+    this.touchButtons = new TouchButtonRegistry(this);
     this.joystick = new VirtualJoystick(this);
     this.createJumpButton();
 
@@ -3409,29 +3500,33 @@ class GameScene extends Phaser.Scene {
     this.jumpBtnBg = bg;
     this.jumpBtnLabel = label;
     this.jumpBtn.add([bg, label, hint]);
-    this.jumpBtn.setSize(hitR * 2, hitR * 2);
-    this.jumpBtn.setInteractive(
-      new Phaser.Geom.Circle(0, 0, hitR),
-      Phaser.Geom.Circle.Contains,
-    );
-    this.jumpBtn.on('pointerdown', (p) => {
-      // Tap feedback: pulse the LABEL only (not the container), so the
-      // hit area stays at its full 64-px radius during the animation.
-      // (A previous version scaled the whole container, which silently
-      // shrank the hit-test circle to ~55 px during the 130 ms tween and
-      // caused edge-of-button taps to be ignored - exactly the "sticky"
-      // intermittent miss the user reported.)
-      this.tweens.killTweensOf(this.jumpBtnLabel);
-      this.jumpBtnLabel.setScale(1);
-      this.tweens.add({
-        targets: this.jumpBtnLabel,
-        scale: { from: 1.28, to: 1 },
-        duration: 130,
-        ease: 'Cubic.easeOut',
-      });
-      this.tryJump(this.time.now);
-      // Stop joystick from also picking up this tap if it leaks.
-      p?.event?.stopPropagation?.();
+
+    // Hit-test happens in TouchButtonRegistry, NOT via setInteractive. The
+    // visible button still lives on the uiCamera (zoom 1), but Phaser's
+    // input plugin was sending hits through cameras.main (zoom 1.6) on
+    // iPad, leaving the hit zone offset from the visible ring. The
+    // registry compares the pointer's canvas pixel directly to the
+    // button's screen position - no camera transform, exact match.
+    this.touchButtons.add({
+      x: x,
+      y: y,
+      shape: 'circle',
+      hitR: hitR,
+      onTap: () => {
+        // Tap feedback: pulse the LABEL only. Scaling the container would
+        // also scale the visual ring, but more importantly any hit-area
+        // shrink mid-animation is no longer possible because we're not
+        // using container-bound geometry anymore.
+        this.tweens.killTweensOf(this.jumpBtnLabel);
+        this.jumpBtnLabel.setScale(1);
+        this.tweens.add({
+          targets: this.jumpBtnLabel,
+          scale: { from: 1.28, to: 1 },
+          duration: 130,
+          ease: 'Cubic.easeOut',
+        });
+        this.tryJump(this.time.now);
+      },
     });
   }
 
@@ -3781,6 +3876,25 @@ class GameScene extends Phaser.Scene {
     });
   }
 
+  /* ----- coalesced screen shake -----
+   * Spammy hazards (meteor salvos on L2, geyser eruptions on L4) used to
+   * stack 2-3 shakes within ~150 ms because each event fires its own
+   * `cameras.main.shake()`. The result felt like the camera was
+   * permanently jittering on those levels - especially nauseating during
+   * extended fights. shakeOnce() suppresses any new shake while a
+   * previously-issued one is still in its window, so successive triggers
+   * collapse into one continuous shake instead of compounding.
+   *
+   * Player-hit and game-over shakes are ONE-time events per trigger, so
+   * they keep using cameras.main.shake() directly - we want full impact
+   * on those, not a coalesced one. */
+  shakeOnce(durationMs, intensity) {
+    const now = this.time.now;
+    if (now < (this._shakeBusyUntil ?? 0)) return;
+    this._shakeBusyUntil = now + durationMs;
+    this.cameras.main.shake(durationMs, intensity);
+  }
+
   /* ----- meteor system ----- */
 
   createMeteorSystem() {
@@ -3912,7 +4026,12 @@ class GameScene extends Phaser.Scene {
         if (m.sprite) { m.sprite.destroy(); m.sprite = null; }
         if (m.trail) { m.trail.destroy(); m.trail = null; }
         Sfx.play('hit');
-        this.cameras.main.shake(120, 0.005);
+        // Halved magnitude + coalesced. With METEOR_SALVO_CHANCE = 0.55,
+        // two impacts often land within 150 ms of each other on L2, and
+        // the previous (120 ms, 0.005) was stacking into a continuous
+        // head-rattle. shakeOnce keeps the per-strike thump but stops the
+        // pile-up.
+        this.shakeOnce(80, 0.0025);
         // Drop a lingering fire patch the player has to dodge. Replaces the
         // old inert scorched crater so meteor strikes leave persistent danger
         // zones, not harmless decoration.
@@ -4170,7 +4289,10 @@ class GameScene extends Phaser.Scene {
           ge.state = 'erupt';
           ge.stateStart = time;
           Sfx.play('hit');
-          this.cameras.main.shake(180, 0.006);
+          // Halved magnitude + coalesced. Geysers cluster around the
+          // player on L4 ("the burning below") and used to stack shakes
+          // through every cooldown window. Less intensity, no piling up.
+          this.shakeOnce(100, 0.003);
         }
         continue;
       }
@@ -5304,6 +5426,12 @@ class BossScene extends Phaser.Scene {
       this.input.keyboard.on(`keydown-${keyName}`, handleDirectionalTap(dir));
     });
 
+    // Same registry-before-joystick ordering as GameScene. The four
+    // ability-slot buttons all live on the right side, but slot 4 (Hydra,
+    // x ~= 442) sits inside the left-60% joystick drag region, so the
+    // registry's `contains()` check is what keeps a hold-to-channel tap
+    // from also dragging the player.
+    this.touchButtons = new TouchButtonRegistry(this);
     this.joystick = new VirtualJoystick(this);
     this.createBossHud();
     this.createAbilityBar();
@@ -6478,23 +6606,21 @@ class BossScene extends Phaser.Scene {
       fontSize: '10px', color: '#cbb3ff',
     }).setOrigin(0.5);
     container.add([bg, icon, hint]);
-    container.setSize(r * 2, r * 2);
-    container.setInteractive(
-      new Phaser.Geom.Circle(0, 0, r),
-      Phaser.Geom.Circle.Contains,
-    );
-    container.on('pointerdown', (p) => {
-      onActivate();
-      p?.event?.stopPropagation?.();
+
+    // Hit-test is delegated to TouchButtonRegistry instead of
+    // setInteractive(geometry). Same reason as the JUMP button on
+    // GameScene: cameras.main.setZoom(1.6) was offsetting Phaser's
+    // per-camera hit transform on iPad. The registry tracks press +
+    // release per pointer.id, so onRelease only fires for pointers that
+    // originally pressed *this* slot - matching the old gameObject-bound
+    // pointerup / pointerupoutside semantics that hydra-channel needs.
+    this.touchButtons.add({
+      x, y,
+      shape: 'circle',
+      hitR: r,
+      onTap: () => onActivate(),
+      ...(onRelease ? { onRelease: () => onRelease() } : {}),
     });
-    if (onRelease) {
-      // Use the container's own pointerup / pointerupoutside so we ONLY fire
-      // onRelease for releases that originated on this button. A global
-      // input.on('pointerup', ...) was triggering hydra-end on unrelated
-      // clicks (e.g. tapping anywhere on the screen).
-      container.on('pointerup', () => onRelease());
-      container.on('pointerupoutside', () => onRelease());
-    }
 
     return {
       container, bg, icon, ultId, r,
