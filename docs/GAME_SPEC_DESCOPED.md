@@ -1,6 +1,6 @@
 # Survive Fire for Brainrots — Descoped Spec (1-Day Web Build)
 
-**Version**: 0.6.1f (Visible-viewport canvas sizing)
+**Version**: 0.6.2 (Persistent progress + 5-pill title + post-boss reset prompt)
 **Last updated**: 2026-05-11
 **Status**: Active build target
 **Relation to north star**: This is a *radically descoped* version of [`GAME_SPEC.md`](./GAME_SPEC.md). The original full-fidelity spec remains the long-term north star. This document defines what we're actually building **today** in a single-day, $0 budget web prototype.
@@ -1145,11 +1145,89 @@ Also: TitleScene had no `scale.refresh()` listeners. GameScene/BossScene refresh
 
 After this, the title fills the visible viewport on first paint with the URL bar showing, and re-fits cleanly when the user scrolls to hide it or rotates between landscape and portrait.
 
-### 22.4 Things deliberately NOT touched
+### 22.4 Things deliberately NOT touched in v0.6.1
 
-- **Issue 2 (missing meteor fires on L2)** — known to be a depth-stacking bug (fires render at `-7..-5`, desert decorations at `(y+1)*32`, so cacti / boulders cover them). User chose to defer.
+
+- **Issue 2 (missing meteor fires on L2)** — known to be a depth-stacking bug (fires render at `-7..-5`, desert decorations at `(y+1)*32`, so cacti / boulders cover them). User chose to defer (and later removed from scope entirely in v0.6.2).
 - **`cameras.main.setZoom(GAME_ZOOM)`** — the zoom is load-bearing for how the world reads visually. Removing it would have been a much bigger blast radius than swapping how the buttons hit-test.
 - **DOM-overlay buttons** — would have lost the integrated Phaser-drawn cooldown ring + gold pulse on the ability slots, plus required absolute-positioning the DOM nodes against the canvas's `Scale.FIT` letterbox after every refresh.
+
+---
+
+## 23. v0.6.2 — Persistent progress + level select
+
+§20 of this doc described the persistent-progress design as a deferred backlog item. v0.6.2 implements it. The TL;DR: title screen now shows a 5-pill row (L1 / L2 / L3 / L4 / FINAL BATTLE) gated by save state in prod mode, and beating the boss triggers a "keep playing or start over?" prompt before returning to title. Single LocalStorage slot per browser, single `DEV_MODE` flag for shipping vs. dev workflows.
+
+### 23.1 Save state
+
+```js
+// Schema v1, persisted under SAVE_KEY = 'survive-fire-brainrots:save:v1'
+{
+  schemaVersion: 1,
+  lastClearedLevel: 0..4,        // 0 = nothing cleared yet
+  bossDefeated:    boolean,
+  unlockedUltimates: string[],   // brainrot ids
+  lastUpdatedAt:   number,       // Date.now() at last write
+}
+```
+
+Wrapped in a `SaveState` module with `read()` / `write(patch)` / `recordLevelCleared(levelId, ultimateId)` / `recordBossDefeat()` / `reset()`. `read()` is defensive: clamps `lastClearedLevel` to `0..4`, drops unknown ultimate ids if the roster ever changes (e.g. mid-development rename), and falls back to defaults on JSON parse errors with a console warning. Slots are not envisioned — single slot per browser.
+
+### 23.2 `DEV_MODE` toggle
+
+Single boolean near the top of `game.js`:
+
+```js
+const DEV_MODE = true;  // flip to false before sharing the Pages URL
+```
+
+Effects:
+- **Title screen pill row:** dev mode renders all 5 pills regardless of save. Prod mode renders only `levelId <= lastClearedLevel + 1` plus the boss pill once `lastClearedLevel >= 4`.
+- **Keyboard `B` shortcut:** only fires the boss launcher if the boss pill is currently unlocked, so prod-mode players can't keystroke past the gate.
+- **Tiny dev hint footer:** only renders in dev mode (it would just look like junk to family).
+
+The save itself is always written/read regardless of `DEV_MODE`; dev mode only bypasses the visibility gate. This means you can play through to verify progression accumulates correctly, then flip the flag and confirm prod-mode looks right without re-shipping.
+
+The old "TEMPORARY: dev shortcut to the boss fight" pill in the bottom-right of the title screen (added in v0.6.1d) has been removed. The boss pill now lives in the level row, gated normally.
+
+### 23.3 5-pill title row
+
+Old layout: 4 pills × 178w with ~10 px gaps, fixed positions `W/2 ± 282`, `W/2 ± 94`.
+
+New layout: up to 5 pills × 144w with 14 px gaps. Total row width when all five visible: `5*144 + 4*14 = 776 px`, leaves 12 px slack on each side of the 800-wide stage. The boss pill gets a distinct red color (`0xff3a3a`) and the `FINAL BATTLE` / `Los Hackers` labels.
+
+In prod mode the row recenters dynamically based on visible-pill count, so on a fresh save (only L1 visible) the lone pill sits at `W/2`, not stuck at `W/2 - 316` where it would land if positions were fixed.
+
+### 23.4 Replay UX
+
+When the player clears a level whose `id <= save.lastClearedLevel`, the run is treated as a replay:
+
+- **Modal:** still shows the same celebratory layout with the ultimate portrait + superpower description, but with two copy tweaks. Headline: `LEVEL X CLEARED AGAIN!` instead of `LEVEL X COMPLETE!`. Subtitle: "Nice run! This ultimate is already in your collection." instead of "You captured a new ultimate brainrot!"
+- **Save:** **not** rewritten. `lastClearedLevel` and `unlockedUltimates` stay where they are.
+- **Proceed button:** routes to Title (so the player can pick the next thing to revisit) rather than the next level.
+
+Modal previews (Shift+1/2/3/4 in dev mode) always force the first-clear path so the celebratory copy stays tunable without persistent state interfering.
+
+### 23.5 Post-boss reset prompt
+
+After defeating Los Hackers, `BossScene.handleVictory()` writes `bossDefeated: true` to save and routes to WinScene as before. WinScene now branches on `bossDefeated`:
+
+**Boss path (`bossDefeated === true`):**
+- Primary button: `↻  KEEP PLAYING` (same gold pill as the old PLAY AGAIN, but routes to Title instead of Game-with-levelId-1). Default-highlighted, also bound to SPACE / ENTER. With save intact, all 5 pills are unlocked on Title.
+- Secondary "↺ Start over" link below the primary, dim purple. **Tap-twice-to-confirm:** first tap morphs the link into red text `Tap again to confirm — this clears your progress`; second tap calls `SaveState.reset()` and routes to Title. If the second tap doesn't land within 5 seconds, the link reverts to its idle copy so an accidental first tap can't sit armed forever.
+
+**Non-boss path (`bossDefeated !== true`):**
+- Cheat-jumped runs that reached WinScene without a boss kill keep the original single `↻ PLAY AGAIN` button that drops back to Game with `levelId: 1`. No reset link — there's no progression earned to reset.
+
+Per discussion, the prompt fires **every time** the boss is beaten (not just the first time). Reasoning: in a family-share scenario, a one-time prompt creates a one-way door — anyone who picks "keep playing" the first time loses reset access forever, forcing DevTools to clean state for another player. Surfacing the prompt on every boss kill stays consistent with the player's expectation when they replay the boss.
+
+### 23.6 Things deliberately NOT in this slice
+
+- **Permanent reset link on the title screen** — superseded by the post-boss prompt. If a player wants to reset before beating the boss, they re-clear the requirement (or a dev opens DevTools).
+- **L2 meteor-fire depth fix** — explicitly removed from scope by user request.
+- **Multi-slot saves** — single shared slot per browser is the intended ergonomic for family share. Adding slots = adding a slot picker UI = scope creep.
+- **Cloud sync** — explicitly out of scope per §20.
+- **Confirmation modal for reset** — replaced by inline tap-twice. Avoids stacking modals on the WinScene which already has a busy roster grid.
 
 ---
 

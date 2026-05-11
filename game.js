@@ -675,6 +675,119 @@ function setBrainrotScale(visual, factor) {
 }
 
 /* ============================================================================
+   Dev / prod mode toggle
+
+   Flip DEV_MODE to `false` before sharing the GitHub Pages URL with family.
+   In dev mode the title screen ignores progression and shows ALL level pills
+   plus the boss pill regardless of save state - useful for jumping into any
+   level / the boss to test changes. In prod mode the title screen reads
+   LocalStorage and only shows pills the player has actually unlocked.
+
+   The save itself is always written/read regardless of DEV_MODE; dev mode
+   just doesn't gate visibility on it. That way you can play through to
+   verify progression, then flip the flag and confirm prod-mode looks right.
+   ============================================================================ */
+
+const DEV_MODE = true;
+
+/* ============================================================================
+   Save state (LocalStorage, single slot per browser)
+
+   Persists between sessions so replaying L1->L4->Boss isn't required every
+   time the player opens the page. Single shared slot per browser is the
+   simplest fit for family-share - no slot picker UI, no cloud sync.
+
+   Schema (v1):
+   {
+     schemaVersion: 1,
+     lastClearedLevel: 0..4,        // 0 = nothing cleared yet
+     bossDefeated:    boolean,
+     unlockedUltimates: string[],   // brainrot ids
+     lastUpdatedAt:   number,       // Date.now() at last write
+   }
+
+   Defensive read drops unknown brainrot ids if the roster ever changes
+   (e.g. a level gets renamed mid-development), so a stale save can't
+   crash the title screen.
+   ============================================================================ */
+
+const SAVE_KEY = 'survive-fire-brainrots:save:v1';
+const SAVE_SCHEMA_VERSION = 1;
+
+const SaveState = {
+  _default() {
+    return {
+      schemaVersion: SAVE_SCHEMA_VERSION,
+      lastClearedLevel: 0,
+      bossDefeated: false,
+      unlockedUltimates: [],
+      lastUpdatedAt: 0,
+    };
+  },
+
+  read() {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return this._default();
+      const parsed = JSON.parse(raw);
+      const knownUltimates = new Set(
+        Object.values(LEVELS).map((lv) => lv.ultimateId).filter(Boolean),
+      );
+      return {
+        schemaVersion: SAVE_SCHEMA_VERSION,
+        lastClearedLevel: Math.max(0, Math.min(4, Number(parsed?.lastClearedLevel) || 0)),
+        bossDefeated: parsed?.bossDefeated === true,
+        unlockedUltimates: Array.isArray(parsed?.unlockedUltimates)
+          ? parsed.unlockedUltimates.filter((id) => knownUltimates.has(id))
+          : [],
+        lastUpdatedAt: Number(parsed?.lastUpdatedAt) || 0,
+      };
+    } catch (e) {
+      console.warn('[SaveState] read failed, returning defaults:', e);
+      return this._default();
+    }
+  },
+
+  write(patch) {
+    const next = {
+      ...this.read(),
+      ...patch,
+      lastUpdatedAt: Date.now(),
+      schemaVersion: SAVE_SCHEMA_VERSION,
+    };
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.warn('[SaveState] write failed:', e);
+    }
+    return next;
+  },
+
+  recordLevelCleared(levelId, ultimateId) {
+    const cur = this.read();
+    const ults = new Set(cur.unlockedUltimates);
+    if (ultimateId) ults.add(ultimateId);
+    return this.write({
+      lastClearedLevel: Math.max(cur.lastClearedLevel, levelId),
+      unlockedUltimates: Array.from(ults),
+    });
+  },
+
+  recordBossDefeat() {
+    return this.write({ bossDefeated: true });
+  },
+
+  reset() {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch (e) {
+      console.warn('[SaveState] reset failed:', e);
+    }
+    return this._default();
+  },
+};
+
+/* ============================================================================
    Sfx + Tts
    ============================================================================ */
 
@@ -1052,68 +1165,129 @@ class TitleScene extends Phaser.Scene {
       this.scene.start('Game', { levelId });
     };
 
-    const makeLevelButton = (xCenter, levelId, label, color) => {
-      const btn = this.add.container(xCenter, H * 0.85);
+    // Read save state once. Used to gate which pills are visible in prod
+    // mode (DEV_MODE = false). In dev mode the gate is bypassed and every
+    // pill renders regardless.
+    const save = SaveState.read();
+
+    const launchBoss = () => {
+      Sfx.init(); Sfx.resume(); Sfx.play('portal');
+      // Boss expects a full kit in `allDeposited`. In prod mode the player
+      // earned all four ultimates by clearing L4, so we could pass exactly
+      // their save - but stitching in every collectible brainrot too means
+      // the WinScene roster lights up correctly post-victory regardless of
+      // how the player got here. Same payload as the old dev-only shortcut.
+      const allUltimates = Object.values(LEVELS)
+        .map((lv) => lv.ultimateId)
+        .filter(Boolean);
+      const allBrainrots = Object.values(LEVELS).flatMap((lv) => lv.brainrotIds);
+      this.scene.start('Boss', {
+        allDeposited: [...new Set([...allUltimates, ...allBrainrots])],
+      });
+    };
+
+    // Pill row: L1..L4 + final-battle. In dev mode all five always render.
+    // In prod mode each pill is gated by save state - locked entries are
+    // hidden entirely (no dimmed placeholder), per design call.
+    const PILL_W = 144;
+    const PILL_H = 76;
+    const PILL_GAP = 14;
+    const pillY = H * 0.85;
+
+    const allPills = [
+      { kind: 'level', id: 1, label: 'The Whirling Halls', color: 0x9c6bff,
+        unlocked: DEV_MODE || save.lastClearedLevel + 1 >= 1 },
+      { kind: 'level', id: 2, label: 'The Falling Sky',    color: 0xff7a3a,
+        unlocked: DEV_MODE || save.lastClearedLevel + 1 >= 2 },
+      { kind: 'level', id: 3, label: "The Bloop's Domain", color: 0x1fa5c8,
+        unlocked: DEV_MODE || save.lastClearedLevel + 1 >= 3 },
+      { kind: 'level', id: 4, label: 'The Burning Below',  color: 0xff4a18,
+        unlocked: DEV_MODE || save.lastClearedLevel + 1 >= 4 },
+      { kind: 'boss',  id: 'boss', label: 'Los Hackers',   color: 0xff3a3a,
+        unlocked: DEV_MODE || save.lastClearedLevel >= 4 },
+    ];
+    const visiblePills = allPills.filter((p) => p.unlocked);
+
+    // Recenter the row so however many pills are visible look balanced.
+    // E.g. on a fresh save in prod mode, only L1 shows and it sits centered;
+    // dev mode (and a fully-cleared prod save) gets all five with even
+    // spacing.
+    const rowW = visiblePills.length * PILL_W
+      + Math.max(0, visiblePills.length - 1) * PILL_GAP;
+    const rowStartX = W / 2 - rowW / 2 + PILL_W / 2;
+
+    const makePill = (xCenter, def) => {
+      const btn = this.add.container(xCenter, pillY);
       const bg = this.add.graphics();
-      const w = 178, h = 76;
-      bg.fillStyle(0x1a0f1f, 1);
-      bg.fillRoundedRect(-w / 2, -h / 2, w, h, 12);
-      bg.lineStyle(3, color, 1);
-      bg.strokeRoundedRect(-w / 2, -h / 2, w, h, 12);
-      const tag = this.add.text(0, -16, `LEVEL ${levelId}`, {
+      const drawBg = (hover) => {
+        bg.clear();
+        bg.fillStyle(hover ? def.color : 0x1a0f1f, 1);
+        bg.fillRoundedRect(-PILL_W / 2, -PILL_H / 2, PILL_W, PILL_H, 12);
+        bg.lineStyle(3, hover ? 0xffe066 : def.color, 1);
+        bg.strokeRoundedRect(-PILL_W / 2, -PILL_H / 2, PILL_W, PILL_H, 12);
+      };
+      drawBg(false);
+
+      const isBoss = def.kind === 'boss';
+      const tag = this.add.text(0, -18, isBoss ? 'FINAL BATTLE' : `LEVEL ${def.id}`, {
         fontFamily: 'Impact, Charcoal, sans-serif',
-        fontSize: '20px', color: '#ffe066',
+        fontSize: isBoss ? '15px' : '18px',
+        color: isBoss ? '#ffd54a' : '#ffe066',
       }).setOrigin(0.5);
-      const name = this.add.text(0, 10, label, {
+      const name = this.add.text(0, 6, def.label, {
         fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: '12px', color: '#ffffff',
+        fontSize: '11px', color: '#ffffff',
+        align: 'center', wordWrap: { width: PILL_W - 16, useAdvancedWrap: true },
       }).setOrigin(0.5);
-      const hint = this.add.text(0, 28, `Press ${levelId}`, {
+      const hintText = isBoss
+        ? 'Press B'
+        : `Press ${def.id}`;
+      const hint = this.add.text(0, 26, hintText, {
         fontFamily: 'system-ui, sans-serif',
-        fontSize: '10px', color: '#aaaaaa',
+        fontSize: '9px', color: '#aaaaaa',
       }).setOrigin(0.5);
       btn.add([bg, tag, name, hint]);
-      btn.setSize(w, h);
+      btn.setSize(PILL_W, PILL_H);
       btn.setInteractive({ useHandCursor: true });
 
       btn.on('pointerover', () => {
-        bg.clear();
-        bg.fillStyle(color, 1);
-        bg.fillRoundedRect(-w / 2, -h / 2, w, h, 12);
-        bg.lineStyle(3, 0xffe066, 1);
-        bg.strokeRoundedRect(-w / 2, -h / 2, w, h, 12);
+        drawBg(true);
         tag.setColor('#1a0f1f');
         name.setColor('#1a0f1f');
         hint.setColor('#1a0f1f');
       });
       btn.on('pointerout', () => {
-        bg.clear();
-        bg.fillStyle(0x1a0f1f, 1);
-        bg.fillRoundedRect(-w / 2, -h / 2, w, h, 12);
-        bg.lineStyle(3, color, 1);
-        bg.strokeRoundedRect(-w / 2, -h / 2, w, h, 12);
-        tag.setColor('#ffe066');
+        drawBg(false);
+        tag.setColor(isBoss ? '#ffd54a' : '#ffe066');
         name.setColor('#ffffff');
         hint.setColor('#aaaaaa');
       });
-      btn.on('pointerdown', () => launch(levelId));
+      btn.on('pointerdown', () => {
+        if (isBoss) launchBoss();
+        else launch(def.id);
+      });
 
       this.tweens.add({
         targets: btn, scale: 1.04,
-        duration: 1100 + levelId * 80,
+        duration: 1100 + (typeof def.id === 'number' ? def.id * 80 : 480),
         yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
       });
       return btn;
     };
 
-    // Four buttons sized 178w with ~10px gaps fit comfortably in W=800.
-    makeLevelButton(W / 2 - 282, 1, 'The Whirling Halls',  0x9c6bff);
-    makeLevelButton(W / 2 - 94,  2, 'The Falling Sky',     0xff7a3a);
-    makeLevelButton(W / 2 + 94,  3, "The Bloop's Domain",  0x1fa5c8);
-    makeLevelButton(W / 2 + 282, 4, 'The Burning Below',   0xff4a18);
+    visiblePills.forEach((def, i) => {
+      const x = rowStartX + i * (PILL_W + PILL_GAP);
+      makePill(x, def);
+    });
 
-    this.input.keyboard.once('keydown-SPACE', () => launch(1));
-    this.input.keyboard.once('keydown-ENTER', () => launch(1));
+    // Keyboard shortcuts only fire if that pill is currently unlocked, so
+    // a fresh prod-mode save can't `Press 4` straight into a locked level.
+    const launchIfUnlocked = (levelId) => {
+      const def = allPills.find((p) => p.id === levelId);
+      if (def?.unlocked) launch(levelId);
+    };
+    this.input.keyboard.once('keydown-SPACE', () => launchIfUnlocked(1));
+    this.input.keyboard.once('keydown-ENTER', () => launchIfUnlocked(1));
     // Number key launches that level. Shift + number opens the level-complete
     // MODAL preview without playing the level - dev convenience for tuning
     // the win banner copy / layout.
@@ -1130,58 +1304,17 @@ class TitleScene extends Phaser.Scene {
     this.input.keyboard.on('keydown-THREE', numberHandler(3));
     this.input.keyboard.on('keydown-FOUR',  numberHandler(4));
 
-    // Dev shortcut: jump straight into the Los Hackers boss arena with all
-    // four ultimates pre-unlocked. Not part of the canonical L1->L4 flow,
-    // just a way to skip the replay loop while testing the fight.
-    const launchBossTest = () => {
-      Sfx.init(); Sfx.resume(); Sfx.play('portal');
-      const allUltimates = Object.values(LEVELS)
-        .map((lv) => lv.ultimateId)
-        .filter(Boolean);
-      // Also stitch in every collectible brainrot so the WinScene roster
-      // shows lit when we beat the boss from the dev shortcut.
-      const allBrainrots = Object.values(LEVELS)
-        .flatMap((lv) => lv.brainrotIds);
-      this.scene.start('Boss', {
-        allDeposited: [...new Set([...allUltimates, ...allBrainrots])],
-      });
-    };
-    this.input.keyboard.on('keydown-B', launchBossTest);
-
-    // TEMPORARY: dev shortcut to the boss fight, touch-friendly version
-    // of keydown-B. The keyboard shortcut isn't reachable on iPad / iPhone,
-    // so this pill button surfaces it in the UI. When persistent progress
-    // lands (see GAME_SPEC_DESCOPED.md §20), this button gets repurposed:
-    // visible only when lastClearedLevel >= 4, hidden otherwise. Search for
-    // "TEMPORARY: dev shortcut to the boss fight" to find the removal site.
-    const bossBtnW = 152;
-    const bossBtnH = 32;
-    const bossBtn = this.add.container(W - 92, H - 52);
-    const bossBg = this.add.graphics();
-    bossBg.fillStyle(0x1a0f1f, 0.88);
-    bossBg.fillRoundedRect(-bossBtnW / 2, -bossBtnH / 2, bossBtnW, bossBtnH, 14);
-    bossBg.lineStyle(2, 0xff4a18, 0.75);
-    bossBg.strokeRoundedRect(-bossBtnW / 2, -bossBtnH / 2, bossBtnW, bossBtnH, 14);
-    const bossLabel = this.add.text(0, 0, '⚡ BOSS (dev)', {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '15px', color: '#ffb066',
-    }).setOrigin(0.5);
-    bossBtn.add([bossBg, bossLabel]);
-    // Hit area is ~24 px taller / wider than the visible pill so big thumbs
-    // can land it comfortably without the button needing to look bigger.
-    bossBtn.setSize(bossBtnW + 24, bossBtnH + 24);
-    bossBtn.setInteractive(
-      new Phaser.Geom.Rectangle(
-        -(bossBtnW + 24) / 2,
-        -(bossBtnH + 24) / 2,
-        bossBtnW + 24,
-        bossBtnH + 24,
-      ),
-      Phaser.Geom.Rectangle.Contains,
-    );
-    bossBtn.on('pointerdown', launchBossTest);
-    bossBtn.on('pointerover', () => bossLabel.setColor('#ffe066'));
-    bossBtn.on('pointerout',  () => bossLabel.setColor('#ffb066'));
+    // Keyboard shortcut to the boss arena. Only fires if the boss pill is
+    // currently unlocked (always true in dev mode; prod mode requires
+    // lastClearedLevel >= 4).
+    this.input.keyboard.on('keydown-B', () => {
+      const bossDef = allPills.find((p) => p.kind === 'boss');
+      if (bossDef?.unlocked) launchBoss();
+    });
+    // The old bottom-right "⚡ BOSS (dev)" pill was a stand-in until
+    // persistent progress landed. It's now replaced by the fifth pill in
+    // the level row (which gates on save state in prod mode and renders
+    // unconditionally in dev mode), so the temporary block is gone.
 
     this.add.text(W / 2, H - 16,
       'WASD / arrows to move on desktop - drag the left side on mobile',
@@ -1189,11 +1322,16 @@ class TitleScene extends Phaser.Scene {
     ).setOrigin(0.5, 1);
 
     // Tiny dev hint, deliberately small + low-contrast so it doesn't compete
-    // with the level buttons but is discoverable for review purposes.
-    this.add.text(W - 8, H - 4,
-      'dev: Shift+1/2/3/4 to preview win modal · B / pill button to test boss',
-      { fontFamily: 'system-ui', fontSize: '10px', color: '#5a4f6a' }
-    ).setOrigin(1, 1);
+    // with the level buttons but is discoverable for review purposes. Only
+    // shown in dev mode - in prod mode this would just clutter the title
+    // for family members who'll never use these shortcuts.
+    if (DEV_MODE) {
+      this.add.text(W - 8, H - 4,
+        'dev: Shift+1/2/3/4 to preview win modal · B for boss · clear save: localStorage.removeItem("'
+          + SAVE_KEY + '")',
+        { fontFamily: 'system-ui', fontSize: '9px', color: '#5a4f6a' }
+      ).setOrigin(1, 1);
+    }
   }
 }
 
@@ -5038,13 +5176,30 @@ class GameScene extends Phaser.Scene {
     if (ultimateId && !cumulative.includes(ultimateId)) cumulative.push(ultimateId);
     const ultimate = ultimateId ? BRAINROT_REGISTRY[ultimateId] : null;
 
+    // Replay detection: if the player has already cleared this level (or
+    // a higher one) before, this run is a replay. We still show a
+    // celebration modal but with alternate "already in your collection"
+    // copy and a single back-to-title button - no progression decision
+    // needed since they're not unlocking anything new.
+    //
+    // Modal-preview launches always take the first-clear path so we can
+    // tune that copy without persistent state interfering.
+    const saveBefore = SaveState.read();
+    const isReplay = !this.isModalPreview && this.levelId <= saveBefore.lastClearedLevel;
+
     // Decide where to route on "Proceed". L1-L3 → next level. L4 → BossScene
     // if the player has all four ultimates (the regular completion path);
     // otherwise → WinScene roster (only happens for cheat-jumped runs).
+    // Replays always route back to the Title so the player can pick the
+    // next thing they want to revisit.
     let nextRoute, nextPayload, nextButtonLabel;
     if (this.isModalPreview) {
       // Preview mode: return to title so the dev can flip through every
       // level's modal in seconds.
+      nextRoute = 'Title';
+      nextPayload = {};
+      nextButtonLabel = '⟵ Back to Title';
+    } else if (isReplay) {
       nextRoute = 'Title';
       nextPayload = {};
       nextButtonLabel = '⟵ Back to Title';
@@ -5068,11 +5223,20 @@ class GameScene extends Phaser.Scene {
       }
     }
 
+    // Persist progression. Skipped on modal previews (which intentionally
+    // shouldn't pollute the save) and on replays of an already-cleared
+    // level (no new info to record). First clears advance lastClearedLevel
+    // and merge the level's ultimate into unlockedUltimates.
+    if (!this.isModalPreview && !isReplay) {
+      SaveState.recordLevelCleared(this.levelId, ultimateId);
+    }
+
     this.showLevelCompleteModal({
       ultimate,
       nextRoute,
       nextPayload,
       nextButtonLabel,
+      isReplay,
     });
   }
 
@@ -5082,7 +5246,7 @@ class GameScene extends Phaser.Scene {
    * the level scene's frozen-state to remain visible in the background.
    * Stays put until the player clicks "Proceed". */
 
-  showLevelCompleteModal({ ultimate, nextRoute, nextPayload, nextButtonLabel }) {
+  showLevelCompleteModal({ ultimate, nextRoute, nextPayload, nextButtonLabel, isReplay = false }) {
     // GameScene runs three cameras (main / sky / ui) with a partition system
     // that routes objects to a camera based on their scrollFactor + depth.
     // Modal must render on the UI camera so it sits screen-locked above the
@@ -5146,18 +5310,24 @@ class GameScene extends Phaser.Scene {
       });
     }
 
-    // Header.
+    // Header. Replay runs use a slightly less-shouty headline since the
+    // player isn't unlocking anything new this run.
     add(this.add.text(cardX, cardY - cardH / 2 + 64,
-      `LEVEL ${this.levelId} COMPLETE!`, {
+      isReplay ? `LEVEL ${this.levelId} CLEARED AGAIN!` : `LEVEL ${this.levelId} COMPLETE!`, {
       fontFamily: 'Impact, Charcoal, sans-serif',
       fontSize: '38px', color: '#ffe066',
       stroke: '#1a0f1f', strokeThickness: 5,
       letterSpacing: 2,
     }).setOrigin(0.5));
 
-    // Subtitle / congrats line.
+    // Subtitle / congrats line. Replay runs note that the ultimate is
+    // already in the player's collection so they don't expect a new
+    // unlock; first clears keep the celebratory "captured a new
+    // ultimate" framing.
     add(this.add.text(cardX, cardY - cardH / 2 + 102,
-      `You captured a new ultimate brainrot!`, {
+      isReplay
+        ? `Nice run! This ultimate is already in your collection.`
+        : `You captured a new ultimate brainrot!`, {
       fontFamily: 'system-ui, sans-serif',
       fontSize: '15px', color: '#cbb3ff',
     }).setOrigin(0.5));
@@ -7425,6 +7595,13 @@ class BossScene extends Phaser.Scene {
     Sfx.play('win');
     this.cameras.main.shake(800, 0.020);
 
+    // Persist the boss kill so the title screen treats the player as
+    // "credits-rolled" on subsequent visits and the WinScene knows to
+    // surface the post-boss reset prompt. Written here (before fade)
+    // so it lands even if the player closes the tab during the
+    // celebration tween.
+    SaveState.recordBossDefeat();
+
     // Disintegrate-and-collapse the boss over 1.4s
     if (this.bossSprite) {
       this.tweens.add({
@@ -7646,8 +7823,19 @@ class WinScene extends Phaser.Scene {
         stroke: '#1a0f1f', strokeThickness: 3,
       }).setOrigin(0.5);
 
-    /* ----- Play Again button ----- */
-    const btn = this.add.text(W / 2, H * 0.94, '↻  PLAY AGAIN', {
+    /* ----- Continue / reset buttons -----
+     * Boss-cleared runs see two actions: a prominent "KEEP PLAYING"
+     * primary that returns to Title with the save intact (the default,
+     * stylistically and via SPACE/ENTER), plus a small dim "Start over"
+     * link that clears the save after a tap-twice confirmation.
+     *
+     * Non-boss runs (cheat-jumped to WinScene without beating Los
+     * Hackers) only see the primary button and it's labeled "PLAY AGAIN"
+     * to keep the original feel of "this is just a roster preview screen,
+     * go play the real game". That path doesn't need a reset prompt
+     * because no progression was earned. */
+    const primaryLabel = bossDefeated ? '↻  KEEP PLAYING' : '↻  PLAY AGAIN';
+    const btn = this.add.text(W / 2, H * 0.91, primaryLabel, {
       fontFamily: 'system-ui, sans-serif',
       fontSize: '22px', color: '#1a0f1f',
       backgroundColor: '#ffe066',
@@ -7655,14 +7843,63 @@ class WinScene extends Phaser.Scene {
     }).setOrigin(0.5).setInteractive({ useHandCursor: true });
     this.tweens.add({ targets: btn, scale: 1.05, duration: 700, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
 
-    const replay = () => this.scene.start('Game', { levelId: 1 });
-    btn.on('pointerdown', replay);
-    this.input.keyboard.once('keydown-SPACE', replay);
-    this.input.keyboard.once('keydown-ENTER', replay);
+    // Boss-cleared default: head back to title and let the player pick
+    // what to revisit (all 5 pills now unlocked in prod mode). Non-boss
+    // runs jump straight back into L1 since that's the canonical "play
+    // again" path.
+    const primaryAction = () => {
+      if (bossDefeated) this.scene.start('Title');
+      else this.scene.start('Game', { levelId: 1 });
+    };
+    btn.on('pointerdown', primaryAction);
+    this.input.keyboard.once('keydown-SPACE', primaryAction);
+    this.input.keyboard.once('keydown-ENTER', primaryAction);
 
-    this.add.text(W / 2, H - 6, 'Survive Fire for Brainrots - thanks for playing!', {
+    if (bossDefeated) {
+      // Tap-twice-to-confirm reset link. Lives at H * 0.965 as a tertiary
+      // action so it doesn't compete with KEEP PLAYING. The state machine:
+      //   idle -> 'Start over' (cbb3ff)
+      //   armed -> 'Tap again to confirm — this clears your progress' (red)
+      //   confirmed -> SaveState.reset(); back to Title
+      // Idle text reverts after 5s if the second tap never lands, so an
+      // accidental first tap can't sit armed forever.
+      const resetLink = this.add.text(W / 2, H * 0.965, '↺  Start over', {
+        fontFamily: 'system-ui, sans-serif',
+        fontSize: '12px', color: '#cbb3ff',
+        // Padding bakes invisible hit-area slack around the text so the
+        // 12-px label is still comfortably tappable on a phone without
+        // visually competing with the KEEP PLAYING button above.
+        padding: { x: 14, y: 8 },
+      }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+
+      let armed = false;
+      let armTimer = null;
+      const disarm = () => {
+        armed = false;
+        resetLink.setText('↺  Start over');
+        resetLink.setColor('#cbb3ff');
+        if (armTimer) { armTimer.remove(false); armTimer = null; }
+      };
+      resetLink.on('pointerdown', () => {
+        if (!armed) {
+          armed = true;
+          resetLink.setText('Tap again to confirm — this clears your progress');
+          resetLink.setColor('#ff7a7a');
+          armTimer = this.time.delayedCall(5000, disarm);
+          return;
+        }
+        if (armTimer) { armTimer.remove(false); armTimer = null; }
+        SaveState.reset();
+        this.scene.start('Title');
+      });
+    }
+
+    // Footer thank-you sits one row above the bottom edge to leave room
+    // for the reset link in the boss-cleared path. Looks identical on
+    // non-boss runs; we just shift the y a touch upward.
+    this.add.text(W / 2, H - 4, 'Survive Fire for Brainrots - thanks for playing!', {
       fontFamily: 'system-ui, sans-serif',
-      fontSize: '11px', color: '#888888',
+      fontSize: '10px', color: '#666666',
     }).setOrigin(0.5, 1);
   }
 }
