@@ -5377,40 +5377,32 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // Proceed button - drawn as a graphics rect + text, both screen-locked
-    // and routed to the UI camera. Hit area is a manual rectangle so we don't
-    // need a Container (which Phaser does not propagate scrollFactor through).
-    const btnW = 280;
+    // Buttons. Two layouts based on whether there's a forward CTA:
+    //   - First-clear runs that advance progression have a forward action
+    //     (Proceed to Level X / Enter the Final Battle / View Roster) on
+    //     the right + a secondary "Back to main" on the left.
+    //   - Replay + modal-preview runs only get "Back to main" centered;
+    //     there's no forward target to offer because nextRoute is already
+    //     'Title' for those paths.
     const btnH = 54;
-    const btnX = cardX;
     const btnY = cardY + cardH / 2 - 50;
+    const isSingleBtn = nextRoute === 'Title';
 
-    const btnBg = add(this.add.graphics());
-    const drawBtn = (hover) => {
-      btnBg.clear();
-      btnBg.fillStyle(hover ? 0x4a3f6a : 0x32254a, 0.95);
-      btnBg.fillRoundedRect(btnX - btnW / 2, btnY - btnH / 2, btnW, btnH, 14);
-      btnBg.lineStyle(3, hover ? 0xffe066 : 0xcbb3ff, 1.0);
-      btnBg.strokeRoundedRect(btnX - btnW / 2, btnY - btnH / 2, btnW, btnH, 14);
-    };
-    drawBtn(false);
-
-    const btnText = add(this.add.text(btnX, btnY, nextButtonLabel, {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '20px', color: '#ffffff',
-      stroke: '#1a0f1f', strokeThickness: 3,
-      letterSpacing: 1,
-    }).setOrigin(0.5));
-    // A near-invisible rectangle owns the click area so the hit zone is
-    // exactly the visual button bounds (Graphics has no native hit area, and
-    // text's hit zone is its bounding box only).
-    const btnHit = add(this.add.rectangle(btnX, btnY, btnW, btnH, 0x000000, 0.001));
-    btnHit.setInteractive({ useHandCursor: true });
+    // "Your progress is saved." reassurance line. Sits ~22 px above the
+    // button row. Only rendered on first-clear runs - a replay didn't
+    // persist anything new this run, and modal previews never write to
+    // save, so the line would be misleading on those paths.
+    if (!isReplay && !this.isModalPreview) {
+      add(this.add.text(cardX, btnY - btnH / 2 - 22,
+        'Your progress is saved.', {
+        fontFamily: 'system-ui, sans-serif',
+        fontSize: '12px', color: '#cbb3ff',
+        fontStyle: 'italic',
+      }).setOrigin(0.5));
+    }
 
     let proceeded = false;
-    btnHit.on('pointerover', () => drawBtn(true));
-    btnHit.on('pointerout',  () => drawBtn(false));
-    btnHit.on('pointerdown', () => {
+    const navigateTo = (route, payload) => {
       if (proceeded) return;
       proceeded = true;
       const fadeMs = 500;
@@ -5418,9 +5410,90 @@ class GameScene extends Phaser.Scene {
       if (this.skyCamera) this.skyCamera.fade(fadeMs, 30, 18, 50);
       if (this.uiCamera) this.uiCamera.fade(fadeMs, 30, 18, 50);
       this.time.delayedCall(fadeMs + 30, () => {
-        this.scene.start(nextRoute, nextPayload);
+        this.scene.start(route, payload);
       });
-    });
+    };
+
+    // makeModalButton mirrors the previous single-button visuals for the
+    // primary variant (purple fill, gold-on-hover ring) and adds a quieter
+    // outlined secondary variant for "Back to main" on the two-button path.
+    // We pass label / primary / onClick / x / w because the rest of the
+    // styling is identical across both buttons.
+    const makeModalButton = ({ x, y, w, h, label, primary, onClick }) => {
+      const bg = add(this.add.graphics());
+      const drawBg = (hover) => {
+        bg.clear();
+        if (primary) {
+          bg.fillStyle(hover ? 0x4a3f6a : 0x32254a, 0.95);
+          bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+          bg.lineStyle(3, hover ? 0xffe066 : 0xcbb3ff, 1.0);
+          bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+        } else {
+          // Secondary: dim outlined pill so the primary CTA stays the
+          // visual default. Hover lifts the outline + text into the same
+          // gold/light-purple register as the primary so the player still
+          // gets clear "this is tappable" feedback.
+          bg.fillStyle(0x1a0f1f, 0.65);
+          bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+          bg.lineStyle(2, hover ? 0xcbb3ff : 0x6a4f6a, 1.0);
+          bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+        }
+      };
+      drawBg(false);
+      const text = add(this.add.text(x, y, label, {
+        fontFamily: 'Impact, Charcoal, sans-serif',
+        fontSize: primary ? '20px' : '17px',
+        color: primary ? '#ffffff' : '#cbb3ff',
+        stroke: '#1a0f1f', strokeThickness: 3,
+        letterSpacing: 1,
+      }).setOrigin(0.5));
+      const hit = add(this.add.rectangle(x, y, w, h, 0x000000, 0.001));
+      hit.setInteractive({ useHandCursor: true });
+      hit.on('pointerover', () => {
+        drawBg(true);
+        if (!primary) text.setColor('#ffe066');
+      });
+      hit.on('pointerout', () => {
+        drawBg(false);
+        if (!primary) text.setColor('#cbb3ff');
+      });
+      hit.on('pointerdown', onClick);
+    };
+
+    if (isSingleBtn) {
+      // Replay / modal preview: only "Back to main", centered, primary
+      // styling because there's nothing else competing for attention.
+      // nextButtonLabel is ignored on this path since the user-facing
+      // wording is owned by the modal here, not the caller.
+      makeModalButton({
+        x: cardX, y: btnY, w: 280, h: btnH,
+        label: '\u2190 Back to main',
+        primary: true,
+        onClick: () => navigateTo('Title', {}),
+      });
+    } else {
+      // First clears: secondary "Back to main" on the left, primary forward
+      // CTA on the right (Proceed to Level X / Enter the Final Battle / View
+      // Roster - whatever triggerWin chose). Both fit comfortably in the
+      // card: 2 * 200 + 14 px gap = 414 px, well under cardW = 560.
+      const sideW = 200;
+      const gap = 14;
+      const totalW = sideW * 2 + gap;
+      const leftX = cardX - totalW / 2 + sideW / 2;
+      const rightX = cardX + totalW / 2 - sideW / 2;
+      makeModalButton({
+        x: leftX, y: btnY, w: sideW, h: btnH,
+        label: '\u2190 Back to main',
+        primary: false,
+        onClick: () => navigateTo('Title', {}),
+      });
+      makeModalButton({
+        x: rightX, y: btnY, w: sideW, h: btnH,
+        label: nextButtonLabel,
+        primary: true,
+        onClick: () => navigateTo(nextRoute, nextPayload),
+      });
+    }
     // Subtle entrance: fade everything in over 280 ms.
     elements.forEach((el) => el.setAlpha(0));
     this.tweens.add({

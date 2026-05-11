@@ -1204,9 +1204,18 @@ When the player clears a level whose `id <= save.lastClearedLevel`, the run is t
 
 - **Modal:** still shows the same celebratory layout with the ultimate portrait + superpower description, but with two copy tweaks. Headline: `LEVEL X CLEARED AGAIN!` instead of `LEVEL X COMPLETE!`. Subtitle: "Nice run! This ultimate is already in your collection." instead of "You captured a new ultimate brainrot!"
 - **Save:** **not** rewritten. `lastClearedLevel` and `unlockedUltimates` stay where they are.
-- **Proceed button:** routes to Title (so the player can pick the next thing to revisit) rather than the next level.
+- **Buttons:** single centered `← Back to main` (routes to Title). No forward CTA because there's nothing new to advance into.
 
 Modal previews (Shift+1/2/3/4 in dev mode) always force the first-clear path so the celebratory copy stays tunable without persistent state interfering.
+
+### 23.4a Level-complete modal button row (first clears)
+
+First-clear modals now end with a two-button row instead of the old single "Proceed" pill, plus a "Your progress is saved." reassurance line just above the buttons:
+
+- **Left ("Back to main", secondary):** outlined pill, dim purple → light purple on hover, gold text on hover. Routes to Title with no payload. Lets a player drop out without committing to the next level (handy when they want to chain replays of an earlier level).
+- **Right (primary forward CTA):** the existing purple-with-gold-on-hover pill the original modal used. Label is whatever `triggerWin` chose: `Proceed to Level X` for L1–L3, `Enter the Final Battle ⚡` after L4 with all four ultimates, `View Roster` for cheat-jumped runs that hit WinScene without a boss kill.
+
+The "Your progress is saved." line is `12 px` system-italic in the same dusty-purple as the subtitle, sitting `22 px` above the button row. It's intentionally only rendered on first-clear runs — replays didn't write to save this run, and modal previews never write at all, so the line would be misleading on those paths. Replays / previews still get the single `← Back to main` button described in 23.4 above.
 
 ### 23.5 Post-boss reset prompt
 
