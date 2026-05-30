@@ -674,6 +674,70 @@ function setBrainrotScale(visual, factor) {
   visual.setScale(bx * factor, by * factor);
 }
 
+/* ----- pixel-art heart for the HUD -----
+ *
+ * 7x7 bitmap rendered as Phaser graphics rectangles, wrapped in a
+ * Container so callers can tween scale/alpha/position uniformly (the
+ * loseHeart pulse + setAlpha(0.2) on lost hearts both work just like
+ * the old emoji text). Returned container exposes `.heartSize` for
+ * layout calculations, and is centered around its own (0,0) origin.
+ *
+ * The bitmap was tuned to read clearly at 4px-per-cell (28x28 visible,
+ * matching the old 26px emoji size). Pass `px:3` for a slightly smaller
+ * variant used in the boss HUD.
+ */
+const PIXEL_HEART_PATTERN = [
+  '.##.##.',
+  '#######',
+  '#######',
+  '#######',
+  '.#####.',
+  '..###..',
+  '...#...',
+];
+
+function makePixelHeart(scene, x, y, opts = {}) {
+  const px = opts.px ?? 4;
+  const fillColor = opts.color ?? 0xff4f6a;
+  const shadowColor = opts.shadowColor ?? 0x4a0a18;
+  const highlightColor = opts.highlightColor ?? 0xffd9e3;
+
+  const container = scene.add.container(x, y);
+  const heartW = PIXEL_HEART_PATTERN[0].length * px;
+  const heartH = PIXEL_HEART_PATTERN.length * px;
+  const ox = -heartW / 2;
+  const oy = -heartH / 2;
+
+  // Drop shadow (1px down-right) for some weight against bright skies.
+  const shadow = scene.add.graphics();
+  shadow.fillStyle(shadowColor, 0.7);
+  PIXEL_HEART_PATTERN.forEach((row, r) => {
+    [...row].forEach((c, ci) => {
+      if (c === '#') shadow.fillRect(ox + ci * px + 1, oy + r * px + 1, px, px);
+    });
+  });
+
+  // Main heart body.
+  const fill = scene.add.graphics();
+  fill.fillStyle(fillColor, 1);
+  PIXEL_HEART_PATTERN.forEach((row, r) => {
+    [...row].forEach((c, ci) => {
+      if (c === '#') fill.fillRect(ox + ci * px, oy + r * px, px, px);
+    });
+  });
+
+  // Two-pixel sheen on the upper-left lobe so the heart reads round.
+  const hi = scene.add.graphics();
+  hi.fillStyle(highlightColor, 0.85);
+  [[1, 1], [2, 1]].forEach(([cx, cy]) => {
+    hi.fillRect(ox + cx * px, oy + cy * px, px, px);
+  });
+
+  container.add([shadow, fill, hi]);
+  container.heartSize = { w: heartW, h: heartH };
+  return container;
+}
+
 /* ============================================================================
    Dev / prod mode toggle
 
@@ -703,6 +767,7 @@ const DEV_MODE = true;
      lastClearedLevel: 0..4,        // 0 = nothing cleared yet
      bossDefeated:    boolean,
      unlockedUltimates: string[],   // brainrot ids
+     introSeen:       boolean,      // true once the v0.6.3 narrative intro played
      lastUpdatedAt:   number,       // Date.now() at last write
    }
 
@@ -721,6 +786,7 @@ const SaveState = {
       lastClearedLevel: 0,
       bossDefeated: false,
       unlockedUltimates: [],
+      introSeen: false,
       lastUpdatedAt: 0,
     };
   },
@@ -740,6 +806,7 @@ const SaveState = {
         unlockedUltimates: Array.isArray(parsed?.unlockedUltimates)
           ? parsed.unlockedUltimates.filter((id) => knownUltimates.has(id))
           : [],
+        introSeen: parsed?.introSeen === true,
         lastUpdatedAt: Number(parsed?.lastUpdatedAt) || 0,
       };
     } catch (e) {
@@ -777,6 +844,10 @@ const SaveState = {
     return this.write({ bossDefeated: true });
   },
 
+  recordIntroSeen() {
+    return this.write({ introSeen: true });
+  },
+
   reset() {
     try {
       localStorage.removeItem(SAVE_KEY);
@@ -793,6 +864,7 @@ const SaveState = {
 
 const Sfx = {
   ctx: null,
+  _droneNodes: null,  // active dread drone (oscillator handles, see playDreadDrone)
   init() {
     if (!this.ctx) {
       try {
@@ -826,6 +898,183 @@ const Sfx = {
     osc.start(t0);
     osc.stop(t0 + p.dur);
   },
+  // Single bird chirp - high-pitched, short, slight pitch sweep with
+  // randomized parameters so a stream of these reads as natural ambience
+  // rather than a robotic ping. Used by IntroScene's bird loop.
+  chirp() {
+    if (!this.ctx) return;
+    const t0 = this.ctx.currentTime;
+    const dur = 0.07 + Math.random() * 0.09;
+    const startFreq = 2400 + Math.random() * 1800;
+    // 60% chance of an upward chirp, 40% downward, gives variety
+    const endFreq = startFreq * (Math.random() < 0.6
+      ? (1.10 + Math.random() * 0.20)
+      : (0.78 + Math.random() * 0.18));
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(startFreq, t0);
+    osc.frequency.linearRampToValueAtTime(endFreq, t0 + dur);
+    const peak = 0.045 + Math.random() * 0.035;
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(peak, t0 + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur);
+  },
+  // Sustained low-frequency dread drone for the Los Hackers approach.
+  // Two slightly detuned saw waves through a low-pass filter give the
+  // thick "something is wrong" pad. fadeInMs/durationMs let the caller
+  // shape attack and total length; stopDreadDrone() can also cut early.
+  playDreadDrone({ durationMs = 5000, fadeInMs = 400, fadeOutMs = 700 } = {}) {
+    if (!this.ctx) return;
+    this.stopDreadDrone();
+    const t0 = this.ctx.currentTime;
+    const totalSec = durationMs / 1000;
+    const fadeInSec = fadeInMs / 1000;
+    const fadeOutSec = fadeOutMs / 1000;
+    const fundFreq = 55; // ~A1
+    const o1 = this.ctx.createOscillator();
+    const o2 = this.ctx.createOscillator();
+    const o3 = this.ctx.createOscillator();
+    const filter = this.ctx.createBiquadFilter();
+    const gain = this.ctx.createGain();
+
+    o1.type = 'sawtooth'; o1.frequency.setValueAtTime(fundFreq, t0);
+    o2.type = 'sawtooth'; o2.frequency.setValueAtTime(fundFreq * 1.012, t0); // 12-cent detune
+    o3.type = 'sine';     o3.frequency.setValueAtTime(fundFreq * 1.5, t0);   // perfect fifth pad
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(140, t0);
+    filter.Q.setValueAtTime(2, t0);
+
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(0.18, t0 + fadeInSec);
+    gain.gain.linearRampToValueAtTime(0.18, t0 + Math.max(fadeInSec, totalSec - fadeOutSec));
+    gain.gain.linearRampToValueAtTime(0, t0 + totalSec);
+
+    o1.connect(filter); o2.connect(filter); o3.connect(filter);
+    filter.connect(gain).connect(this.ctx.destination);
+    o1.start(t0); o2.start(t0); o3.start(t0);
+    o1.stop(t0 + totalSec); o2.stop(t0 + totalSec); o3.stop(t0 + totalSec);
+
+    this._droneNodes = { o1, o2, o3, gain, endsAt: t0 + totalSec };
+  },
+  stopDreadDrone() {
+    if (!this.ctx || !this._droneNodes) return;
+    const { o1, o2, o3, gain } = this._droneNodes;
+    const t = this.ctx.currentTime;
+    try {
+      gain.gain.cancelScheduledValues(t);
+      gain.gain.setValueAtTime(gain.gain.value, t);
+      gain.gain.linearRampToValueAtTime(0, t + 0.25);
+      o1.stop(t + 0.27);
+      o2.stop(t + 0.27);
+      o3.stop(t + 0.27);
+    } catch (e) { /* nodes may have already ended */ }
+    this._droneNodes = null;
+  },
+  // Cheerful chiptune loop for the true-ending dance party. Two voices:
+  // a square-wave melody bouncing through a G-major arpeggio motif, plus
+  // a triangle-wave bass walking root/fifth. Each "bar" is scheduled
+  // ~150ms before the previous one ends so the loop is gapless. Stopping
+  // is best-effort: notes already scheduled in the audio graph play out
+  // their tail (which is short - eighth notes), but no new bars get
+  // queued. Pass volume 0.05-0.15 for tasteful background levels.
+  playHappyLoop({ volume = 0.10 } = {}) {
+    if (!this.ctx) return;
+    this.stopHappyLoop();
+
+    // G major scale frequencies (Hz). Hand-rolled rather than computed
+    // so the table is greppable and easy to tweak.
+    const F = {
+      G2: 98.00,  D3: 146.83, G3: 196.00, A3: 220.00, B3: 246.94,
+      C4: 261.63, D4: 293.66, E4: 329.63, FS4: 369.99, G4: 392.00,
+      A4: 440.00, B4: 493.88,
+    };
+
+    // 16-step pattern at 0.20s per step = ~150 BPM eighth notes.
+    // 0 = rest. Two-bar phrase that resolves back to the I chord.
+    const MEL = [
+      F.G3, 0,    F.B3, 0,    F.D4, 0,    F.G4, 0,
+      F.E4, 0,    F.D4, 0,    F.B3, 0,    F.D4, 0,
+      F.A3, 0,    F.C4, 0,    F.D4, 0,    F.G4, 0,
+      F.A4, F.G4, F.E4, 0,    F.D4, 0,    F.G3, 0,
+    ];
+    // Bass holds each root for 4 steps (half note) in the alternating
+    // I - V pattern that gives major-key songs their lift.
+    const BASS = [
+      F.G2, 0,    0,    0,    F.D3, 0,    0,    0,
+      F.G2, 0,    0,    0,    F.D3, 0,    0,    0,
+      F.D3, 0,    0,    0,    F.G2, 0,    0,    0,
+      F.D3, 0,    0,    0,    F.G2, 0,    0,    0,
+    ];
+
+    const STEP_SEC = 0.20;
+    const BAR_SEC  = STEP_SEC * MEL.length;
+
+    this._happyLoopActive = true;
+    this._happyLoopVolume = volume;
+    let nextStart = this.ctx.currentTime + 0.05;
+
+    const scheduleBar = () => {
+      if (!this._happyLoopActive || !this.ctx) return;
+      const t0 = nextStart;
+      for (let i = 0; i < MEL.length; i++) {
+        const t = t0 + i * STEP_SEC;
+        // Melody: square wave for that chiptune bite. 85% step length so
+        // notes have a tiny gap (staccato bounce).
+        if (MEL[i]) this._scheduleHappyNote(t, MEL[i], STEP_SEC * 0.85, 'square', volume * 0.55);
+        // Bass: triangle wave (mellow), held longer for sustain feel.
+        if (BASS[i]) this._scheduleHappyNote(t, BASS[i], STEP_SEC * 1.6, 'triangle', volume);
+      }
+      nextStart += BAR_SEC;
+      const wait = (nextStart - this.ctx.currentTime - 0.15) * 1000;
+      this._happyLoopTimer = setTimeout(scheduleBar, Math.max(50, wait));
+    };
+    scheduleBar();
+  },
+  _scheduleHappyNote(t, freq, dur, type, vol) {
+    if (!this.ctx) return;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(vol, t + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    osc.connect(gain).connect(this.ctx.destination);
+    osc.start(t);
+    osc.stop(t + dur + 0.02);
+  },
+  stopHappyLoop() {
+    if (this._happyLoopTimer) {
+      clearTimeout(this._happyLoopTimer);
+      this._happyLoopTimer = null;
+    }
+    this._happyLoopActive = false;
+  },
+  // Discordant cluster sting - root + minor 9th + tritone, descending.
+  // Plays once on Los Hackers' first appearance to punch the moment.
+  playDreadSting() {
+    if (!this.ctx) return;
+    const t0 = this.ctx.currentTime;
+    const dur = 1.1;
+    const freqs = [220.00, 233.08, 311.13]; // A3, A#3, D#4 (root + b9 + tritone)
+    freqs.forEach((f) => {
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(f, t0);
+      osc.frequency.exponentialRampToValueAtTime(f * 0.92, t0 + dur);
+      gain.gain.setValueAtTime(0, t0);
+      gain.gain.linearRampToValueAtTime(0.08, t0 + 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+      osc.connect(gain).connect(this.ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + dur);
+    });
+  },
 };
 
 const Tts = {
@@ -850,6 +1099,25 @@ const Tts = {
       if (this.italianVoice) u.voice = this.italianVoice;
       window.speechSynthesis.speak(u);
     } catch (e) { /* noop */ }
+  },
+  // Narrate is the English counterpart of speak() - used by the v0.6.3
+  // narrative intro / outro cards. We deliberately don't pin a voice (let
+  // the browser pick its default English voice) and slow the rate slightly
+  // so the storybook lines feel deliberate rather than rushed.
+  narrate(text) {
+    if (!('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      u.rate = 0.95;
+      u.volume = 1.0;
+      window.speechSynthesis.speak(u);
+    } catch (e) { /* noop */ }
+  },
+  cancel() {
+    if (!('speechSynthesis' in window)) return;
+    try { window.speechSynthesis.cancel(); } catch (e) { /* noop */ }
   },
 };
 
@@ -1086,7 +1354,488 @@ class BootScene extends Phaser.Scene {
   }
   create() {
     Tts.init();
-    this.scene.start('Title');
+    this.scene.start('Intro');
+  }
+}
+
+/* ============================================================================
+   Intro Scene (v0.6.3)
+
+   Plays once on first launch (gated by SaveState.introSeen) so the player
+   gets a short narrative setup before the title screen: idyllic forest,
+   brainrots having fun, sky darkens, Los Hackers descends, brainrots
+   scatter, hero rises - "Bring them home." Then drops to the Title.
+
+   Skippable after a 1500ms grace window with any tap / key. The skip path
+   and the natural-completion path both write `introSeen: true` to save
+   state so subsequent loads bypass the cinematic. Dev mode and the title
+   screen's "replay intro" link both pass `{ force: true }` to bypass the
+   gate without clearing the flag.
+
+   Implementation notes:
+   - Visuals are drawn directly with Phaser.Graphics (no atlas / no new
+     assets) - skybox / floor / scatter / trees mirror the BossScene forest
+     vocabulary so the world reads as the same place where the boss lives.
+   - Zelda-style typewriter cards: a full-screen dim overlay plus a bold
+     gold-cream serif text in a bordered dialog box at the bottom of the
+     screen. Text reveals letter-by-letter at 35 ms/char, lingers, then
+     fades. No TTS - the player reads at their own pace.
+   ============================================================================ */
+
+class IntroScene extends Phaser.Scene {
+  constructor() { super('Intro'); }
+
+  create(data) {
+    bindViewportRefresh(this);
+    Tts.init();
+
+    // Gate: skip straight to Title if we've already played the intro and
+    // the caller didn't explicitly force a replay. DEV_MODE always plays.
+    const save = SaveState.read();
+    const force = data?.force === true;
+    if (save.introSeen && !DEV_MODE && !force) {
+      this.scene.start('Title');
+      return;
+    }
+
+    const W = this.scale.width;
+    const H = this.scale.height;
+
+    this.cameras.main.setBackgroundColor('#1a0f1f');
+    this.introEnded = false;
+    this._sceneStartedAt = this.time.now;
+    this.scheduledCalls = [];
+    // Card display objects (dim overlay + dialog box + text + typer
+    // TimerEvent). Pushed by showZeldaCard, drained on skip/shutdown so
+    // a partially-typed card can't survive into the title scene.
+    this.activeCardObjects = [];
+
+    // Audio context. On the very first page load some browsers (Safari
+    // iOS especially) won't actually start audio until a user gesture,
+    // so the ambient bird loop may be silent until the player taps to
+    // skip - but on every replay-from-title the gesture has already
+    // happened and birds + drone work normally.
+    Sfx.init();
+    Sfx.resume();
+
+    /* ----- forest skybox ----- */
+    const sky = this.add.graphics();
+    for (let y = 0; y < H; y += 4) {
+      const t = y / H;
+      const r = Math.floor(120 + (1 - t) * 80);
+      const gr = Math.floor(170 + (1 - t) * 40);
+      const b = Math.floor(190 - t * 60);
+      sky.fillStyle((r << 16) | (gr << 8) | b, 1);
+      sky.fillRect(0, y, W, 4);
+    }
+    sky.fillStyle(0xfff5c4, 0.10);
+    for (let i = 0; i < 6; i++) {
+      const x = (W / 6) * i + 30;
+      sky.fillTriangle(x, 0, x - 40, H, x + 40, H);
+    }
+
+    /* ----- distant tree band ----- */
+    const treeBand = this.add.graphics();
+    for (let i = 0; i < 8; i++) {
+      const cx = (W / 8) * i + 45;
+      const cy = H * 0.55;
+      treeBand.fillStyle(0x3a2616, 1);
+      treeBand.fillRect(cx - 8, cy - 2, 16, 36);
+      treeBand.fillStyle(0x1f4a14, 1);
+      treeBand.fillCircle(cx, cy - 28, 32);
+      treeBand.fillCircle(cx - 18, cy - 20, 24);
+      treeBand.fillCircle(cx + 18, cy - 20, 24);
+      treeBand.fillStyle(0x2f6a1c, 1);
+      treeBand.fillCircle(cx - 6, cy - 34, 18);
+      treeBand.fillCircle(cx + 10, cy - 32, 16);
+    }
+
+    /* ----- grass floor ----- */
+    const floor = this.add.graphics();
+    floor.fillStyle(0x2a4a1a, 1);
+    floor.fillRect(0, H * 0.55, W, H * 0.45);
+    floor.fillStyle(0x1f3a14, 0.55);
+    for (let i = 0; i < 50; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(Math.round(H * 0.56), H);
+      const r = Phaser.Math.Between(20, 60);
+      floor.fillCircle(x, y, r);
+    }
+
+    /* ----- foreground scatter (ferns / mushrooms / grass tufts) ----- */
+    const scatter = this.add.graphics();
+    for (let i = 0; i < 90; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(Math.round(H * 0.58), H - 10);
+      const kind = Math.random();
+      if (kind < 0.55) {
+        scatter.lineStyle(2, 0x6db84a, 0.85);
+        scatter.lineBetween(x - 3, y + 4, x - 3, y - 2);
+        scatter.lineBetween(x,     y + 4, x,     y - 4);
+        scatter.lineBetween(x + 3, y + 4, x + 3, y - 1);
+      } else if (kind < 0.85) {
+        scatter.fillStyle(0x4a8c2e, 0.85);
+        scatter.fillCircle(x, y, 4);
+        scatter.fillCircle(x + 4, y - 1, 3);
+        scatter.fillCircle(x - 4, y - 1, 3);
+      } else {
+        scatter.fillStyle(0xfff8e8, 1);
+        scatter.fillRect(x - 1, y, 2, 4);
+        scatter.fillStyle(0xc8323a, 1);
+        scatter.fillCircle(x, y, 3);
+      }
+    }
+
+    /* ----- happy brainrots in the foreground ----- */
+    // Sample 10 across the four levels so the opening visually hints at
+    // the full roster you're about to meet. Each one bobs idly.
+    const sampleIds = [
+      'bombo', 'chimpanzini', 'meowl', 'boneca', 'fragola',
+      'pancake', 'tralalero', 'octopusini', 'arcadragon', 'cocofanto',
+    ];
+    this.brainrotSprites = sampleIds.map((id, i) => {
+      const dataItem = BRAINROT_REGISTRY[id];
+      const t = i / (sampleIds.length - 1);
+      const x = 70 + t * (W - 140) + Phaser.Math.Between(-14, 14);
+      const y = H * 0.66 + Phaser.Math.Between(-10, 28);
+      const v = makeBrainrotVisual(this, x, y, dataItem, 46);
+      v._homeY = y;
+      v._bobTween = this.tweens.add({
+        targets: v, y: y - 8,
+        duration: 600 + i * 80,
+        yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+      });
+      return v;
+    });
+
+    /* ----- twinkly sparkles (idyllic vibe) ----- */
+    this.sparkleG = this.add.graphics();
+    this.sparkles = [];
+    for (let i = 0; i < 16; i++) {
+      this.sparkles.push({
+        x: Phaser.Math.Between(40, W - 40),
+        y: Phaser.Math.Between(80, Math.round(H * 0.55)),
+        twinkle: Phaser.Math.FloatBetween(0, Math.PI * 2),
+      });
+    }
+
+    /* ----- crimson "darkness" overlay (alpha=0 until beat 2) ----- */
+    this.darkOverlay = this.add.graphics();
+    this.darkOverlay.fillStyle(0x4a0a18, 1);
+    this.darkOverlay.fillRect(0, 0, W, H);
+    this.darkOverlay.setAlpha(0);
+    this.darkOverlay.setDepth(50);
+
+    /* ----- skip hint (revealed after the grace window) ----- */
+    this.skipGraceMs = 1500;
+    this.skipHint = this.add.text(W - 12, H - 10, 'tap / press any key to skip ▸', {
+      fontFamily: 'system-ui, sans-serif',
+      fontSize: '12px', color: '#ffffffaa',
+    }).setOrigin(1, 1).setAlpha(0).setDepth(10000);
+
+    const skip = () => {
+      if (this.introEnded) return;
+      if (this.time.now - this._sceneStartedAt < this.skipGraceMs) return;
+      this.endIntro();
+    };
+    this.input.on('pointerdown', () => { Sfx.resume(); skip(); });
+    this.input.keyboard.on('keydown', skip);
+
+    this.scheduledCalls.push(this.time.delayedCall(this.skipGraceMs, () => {
+      if (this.introEnded || !this.skipHint?.scene) return;
+      this.tweens.add({ targets: this.skipHint, alpha: 1, duration: 400 });
+    }));
+
+    /* ============================
+       Beat schedule
+       ============================ */
+
+    // Beat 0 (immediate): start ambient bird loop for the idyllic phase
+    this.startBirdAmbience();
+
+    // Beat 1 (t=400): Card 1 - "Long ago, the brainrots lived in peace."
+    this.scheduledCalls.push(this.time.delayedCall(400, () => {
+      if (this.introEnded) return;
+      this.showZeldaCard('Long ago, the brainrots lived in peace…');
+    }));
+
+    // Beat 2 (t=4500): Birds cut, sky darkens, dread drone fades in
+    this.scheduledCalls.push(this.time.delayedCall(4500, () => {
+      if (this.introEnded) return;
+      this.stopBirdAmbience();
+      this.tweens.add({
+        targets: this.darkOverlay,
+        alpha: 0.55,
+        duration: 700, ease: 'Quad.easeIn',
+      });
+      this.cameras.main.shake(700, 0.005);
+      Sfx.play('hit');
+      // Drone runs from sky-darken through the rest of the cinematic so
+      // the dread carries through Card 2 + scatter + Card 3.
+      Sfx.playDreadDrone({ durationMs: 6500, fadeInMs: 500, fadeOutMs: 800 });
+    }));
+
+    // Beat 3 (t=5200): Los Hackers descends + Card 2 + dread sting on landing
+    this.scheduledCalls.push(this.time.delayedCall(5200, () => {
+      if (this.introEnded) return;
+      let lh;
+      if (this.textures.exists('sprite_los_hackers')) {
+        // Match the boss-fight display size so the silhouette reads as
+        // "the same enormous threat you'll face later" rather than a
+        // little floating villain icon.
+        lh = this.add.image(W / 2, -160, 'sprite_los_hackers')
+          .setDisplaySize(BOSS_DISPLAY_W, BOSS_DISPLAY_H);
+      } else {
+        lh = this.add.text(W / 2, -160, '👤⚡', { fontSize: '96px' }).setOrigin(0.5);
+      }
+      lh.setDepth(60);
+      this.losHackersSprite = lh;
+      // Land in the lower half so it doesn't collide with the dialog
+      // box that now lives at the top of the screen.
+      this.tweens.add({
+        targets: lh,
+        y: H * 0.42,
+        duration: 900,
+        ease: 'Bounce.easeOut',
+        onComplete: () => {
+          if (this.introEnded) return;
+          this.cameras.main.shake(500, 0.015);
+          Sfx.play('hit');
+          Sfx.playDreadSting();
+          // Sinister pulsing scale on the boss silhouette
+          const baseSx = lh.scaleX;
+          const baseSy = lh.scaleY;
+          this.tweens.add({
+            targets: lh,
+            scaleX: baseSx * 1.06, scaleY: baseSy * 1.06,
+            duration: 420,
+            yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+          });
+        },
+      });
+      this.showZeldaCard('Until Los Hackers came.');
+    }));
+
+    // Beat 4 (t=6300): Brainrots scatter to the corners and fade
+    this.scheduledCalls.push(this.time.delayedCall(6300, () => {
+      if (this.introEnded) return;
+      this.brainrotSprites.forEach((b, i) => {
+        if (b._bobTween) b._bobTween.stop();
+        const dx = (b.x < W / 2)
+          ? -120 - Math.random() * 90
+          : 120 + Math.random() * 90;
+        const dy = -50 - Math.random() * 70;
+        this.tweens.add({
+          targets: b,
+          x: b.x + dx,
+          y: b.y + dy,
+          alpha: 0.18,
+          angle: Phaser.Math.Between(-30, 30),
+          duration: 1100,
+          delay: i * 55,
+          ease: 'Quad.easeOut',
+        });
+      });
+      Sfx.play('hit');
+    }));
+
+    // Beat 5 (t=8100): Hero rises + Card 3
+    this.scheduledCalls.push(this.time.delayedCall(8100, () => {
+      if (this.introEnded) return;
+      let hero;
+      if (this.textures.exists('sprite_player_boy')) {
+        hero = this.add.image(W / 2, H * 0.82, 'sprite_player_boy').setDisplaySize(70, 70);
+      } else {
+        hero = this.add.text(W / 2, H * 0.82, '🏃', { fontSize: '56px' }).setOrigin(0.5);
+      }
+      hero.setAlpha(0);
+      hero.setDepth(70);
+      this.heroSprite = hero;
+      this.tweens.add({
+        targets: hero, alpha: 1, y: H * 0.74,
+        duration: 700, ease: 'Quad.easeOut',
+      });
+      this.showZeldaCard('Help the brainrots.');
+    }));
+
+    // Beat 6 (t=10800): End the cinematic and route to Title
+    this.scheduledCalls.push(this.time.delayedCall(10800, () => {
+      this.endIntro();
+    }));
+
+    // Bookkeeping cleanup if the scene shuts down for any other reason
+    // (e.g. dev hot-reload). Without this, dangling listeners on the
+    // input plugin would survive and double-fire on re-entry, and any
+    // playing dread drone would carry into the title scene.
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      Tts.cancel();
+      Sfx.stopDreadDrone();
+      this._birdLoopActive = false;
+      this.input?.removeAllListeners?.();
+      this.input?.keyboard?.removeAllListeners?.();
+    });
+  }
+
+  // Ambient bird chirps for the idyllic phase. Each iteration plays one
+  // or a 2-3 chirp cluster, then schedules the next iteration. The loop
+  // self-cancels via `_birdLoopActive` so endIntro / sky-darken can stop
+  // it cleanly without leaving a dangling timer firing chirps over the
+  // dread drone.
+  startBirdAmbience() {
+    this._birdLoopActive = true;
+    const scheduleNext = () => {
+      if (!this._birdLoopActive || this.introEnded) return;
+      const isCluster = Math.random() < 0.35;
+      if (isCluster) {
+        const count = 2 + Math.floor(Math.random() * 2);
+        for (let i = 0; i < count; i++) {
+          const c = this.time.delayedCall(i * (60 + Math.random() * 80), () => {
+            if (this._birdLoopActive && !this.introEnded) Sfx.chirp();
+          });
+          this.scheduledCalls.push(c);
+        }
+      } else {
+        Sfx.chirp();
+      }
+      const nextDelay = 600 + Math.random() * 1000;
+      this._birdEvent = this.time.delayedCall(nextDelay, scheduleNext);
+      this.scheduledCalls.push(this._birdEvent);
+    };
+    scheduleNext();
+  }
+
+  stopBirdAmbience() {
+    this._birdLoopActive = false;
+    if (this._birdEvent) {
+      this._birdEvent.remove(false);
+      this._birdEvent = null;
+    }
+  }
+
+  // Zelda-style narrative card: dim overlay + small bordered dialog box
+  // at the TOP of the screen + bold cream-gold pixel-style text revealed
+  // letter-by-letter (typewriter at 60ms/char, slower for readability).
+  // No TTS - the user reads at their own pace, then it fades and the
+  // visual beat keeps playing.
+  showZeldaCard(text) {
+    const W = this.scale.width;
+    const H = this.scale.height;
+
+    const CHAR_DELAY_MS = 60;
+    const LINGER_MS     = 1100;
+    const FADE_MS       = 380;
+
+    // Subtle dim vignette so the card text is always legible regardless
+    // of which beat is on screen behind it.
+    const dim = this.add.graphics().setDepth(9999);
+    dim.fillStyle(0x000000, 0.55);
+    dim.fillRect(0, 0, W, H);
+    dim.setAlpha(0);
+    this.tweens.add({ targets: dim, alpha: 1, duration: 280, ease: 'Quad.easeOut' });
+
+    // Top-anchored dialog box with gold-cream double border.
+    const boxW = Math.min(560, W * 0.86);
+    const boxH = 80;
+    const boxCx = W / 2;
+    const boxCy = H * 0.13;
+    const box = this.add.graphics().setDepth(10000);
+    box.fillStyle(0x0a0610, 0.94);
+    box.fillRoundedRect(boxCx - boxW / 2, boxCy - boxH / 2, boxW, boxH, 8);
+    box.lineStyle(3, 0xfde58c, 0.95);
+    box.strokeRoundedRect(boxCx - boxW / 2, boxCy - boxH / 2, boxW, boxH, 8);
+    // Inner thin gold rim for depth
+    box.lineStyle(1, 0xffe066, 0.55);
+    box.strokeRoundedRect(boxCx - boxW / 2 + 5, boxCy - boxH / 2 + 5, boxW - 10, boxH - 10, 6);
+    box.setAlpha(0);
+    this.tweens.add({ targets: box, alpha: 1, duration: 280, ease: 'Quad.easeOut' });
+
+    const card = this.add.text(boxCx, boxCy, '', {
+      // Pixel-art font (loaded via Google Fonts in index.html). Falls
+      // back to bold serif if the network blocks the request.
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '13px',
+      color: '#fde58c',
+      stroke: '#1a0a08',
+      strokeThickness: 3,
+      align: 'center',
+      lineSpacing: 6,
+      wordWrap: { width: boxW - 36 },
+    }).setOrigin(0.5).setDepth(10001).setAlpha(0);
+    card.setShadow(2, 2, '#3a2410', 3, true, true);
+    this.tweens.add({ targets: card, alpha: 1, duration: 280 });
+
+    // Letter-by-letter reveal
+    let i = 0;
+    const typer = this.time.addEvent({
+      delay: CHAR_DELAY_MS,
+      repeat: text.length - 1,
+      callback: () => {
+        i++;
+        if (card?.scene) card.setText(text.slice(0, i));
+      },
+    });
+
+    // Fade the whole card out together after the linger
+    const lingerEnd = text.length * CHAR_DELAY_MS + LINGER_MS;
+    const fadeTween = this.tweens.add({
+      targets: [dim, box, card],
+      alpha: 0,
+      delay: lingerEnd,
+      duration: FADE_MS,
+      onComplete: () => {
+        dim.destroy();
+        box.destroy();
+        card.destroy();
+        if (typer) typer.remove(false);
+        this.activeCardObjects = this.activeCardObjects.filter(
+          (o) => o !== dim && o !== box && o !== card && o !== typer && o !== fadeTween,
+        );
+      },
+    });
+
+    this.activeCardObjects.push(dim, box, card, typer, fadeTween);
+    return lingerEnd + FADE_MS;
+  }
+
+  update(_time, delta) {
+    if (this.introEnded) return;
+    if (this.sparkleG && this.sparkles) {
+      this.sparkleG.clear();
+      this.sparkles.forEach((s) => {
+        s.twinkle += (delta || 16) * 0.004;
+        const a = 0.4 + Math.sin(s.twinkle) * 0.5;
+        if (a > 0) {
+          this.sparkleG.fillStyle(0xfff5c4, Math.max(0, a));
+          this.sparkleG.fillCircle(s.x, s.y, 1.5);
+        }
+      });
+    }
+  }
+
+  endIntro() {
+    if (this.introEnded) return;
+    this.introEnded = true;
+    this.stopBirdAmbience();
+    Sfx.stopDreadDrone();
+    Tts.cancel();
+    this.scheduledCalls.forEach((c) => c?.remove(false));
+    this.scheduledCalls = [];
+    // Tear down any in-flight Zelda card (graphics, text, typer event,
+    // fade tween) explicitly. tweens.killAll() below would prevent the
+    // fadeTween's onComplete from firing, so without this the card
+    // graphics would zombie into the title scene.
+    if (this.activeCardObjects) {
+      this.activeCardObjects.forEach((o) => {
+        if (!o) return;
+        if (typeof o.destroy === 'function') o.destroy();
+        else if (typeof o.remove === 'function') o.remove(false);
+      });
+      this.activeCardObjects = [];
+    }
+    this.tweens.killAll();
+    SaveState.recordIntroSeen();
+    this.cameras.main.fade(500, 0, 0, 0);
+    this.time.delayedCall(550, () => this.scene.start('Title'));
   }
 }
 
@@ -1110,67 +1859,32 @@ class TitleScene extends Phaser.Scene {
     const H = this.scale.height;
     this.cameras.main.setBackgroundColor('#1a0f1f');
 
-    const bg = this.add.graphics();
-    for (let y = 0; y < H; y += 4) {
-      const t = y / H;
-      const r = Math.floor(26 + t * 30);
-      const g = Math.floor(15 + t * 20);
-      const b = Math.floor(31 + t * 50);
-      bg.fillStyle((r << 16) | (g << 8) | b, 1);
-      bg.fillRect(0, y, W, 4);
-    }
-    const stars = this.add.graphics();
-    stars.fillStyle(0xffe066, 1);
-    for (let i = 0; i < 40; i++) {
-      stars.fillCircle(
-        Phaser.Math.Between(0, W),
-        Phaser.Math.Between(0, H * 0.7),
-        Phaser.Math.FloatBetween(0.5, 1.6)
-      );
-    }
+    /* ----- forest background (matches the intro environment so the
+       title visually leads into the narrative) ----- */
+    this.drawForestBackground(W, H);
 
-    this.add.text(W / 2, H * 0.16, 'SURVIVE FIRE', {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '58px', color: '#ffe066',
-      stroke: '#1a0f1f', strokeThickness: 8,
+    /* ----- title (Press Start 2P pixel font, two lines) ----- */
+    this.add.text(W / 2, H * 0.15, 'SURVIVE FIRE', {
+      fontFamily: '"Press Start 2P", Impact, Charcoal, sans-serif',
+      fontSize: '28px', color: '#ffe066',
+      stroke: '#1a0f1f', strokeThickness: 6,
     }).setOrigin(0.5);
 
     this.add.text(W / 2, H * 0.27, 'FOR BRAINROTS', {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '58px', color: '#ff6b9d',
-      stroke: '#1a0f1f', strokeThickness: 8,
+      fontFamily: '"Press Start 2P", Impact, Charcoal, sans-serif',
+      fontSize: '28px', color: '#ff6b9d',
+      stroke: '#1a0f1f', strokeThickness: 6,
     }).setOrigin(0.5);
 
-    [getLevelBrainrots(1), getLevelBrainrots(2), getLevelBrainrots(3), getLevelBrainrots(4)].forEach((row, ri) => {
-      row.forEach((b, i) => {
-        const x = W / 2 + (i - 2) * 70;
-        const y = H * 0.40 + ri * 46;
-        const t = makeBrainrotVisual(this, x, y, b, 36);
-        this.tweens.add({
-          targets: t, y: y - 7,
-          duration: 600 + i * 100 + ri * 50,
-          yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
-        });
-      });
-    });
+    /* ----- launch helpers (used by buttons + keyboard shortcuts) ----- */
+    const save = SaveState.read();
 
-    this.add.text(W / 2, H * 0.71, 'Pick a level to start. Each level: collect 5 brainrots, reach the portal.', {
-      fontFamily: 'system-ui, -apple-system, sans-serif',
-      fontSize: '14px', color: '#ffffff',
-      align: 'center',
-    }).setOrigin(0.5);
-
-    const launch = (levelId) => {
+    this._launch = (levelId) => {
       Sfx.init(); Sfx.resume(); Sfx.play('portal');
       this.scene.start('Game', { levelId });
     };
 
-    // Read save state once. Used to gate which pills are visible in prod
-    // mode (DEV_MODE = false). In dev mode the gate is bypassed and every
-    // pill renders regardless.
-    const save = SaveState.read();
-
-    const launchBoss = () => {
+    this._launchBoss = () => {
       Sfx.init(); Sfx.resume(); Sfx.play('portal');
       // Boss expects a full kit in `allDeposited`. In prod mode the player
       // earned all four ultimates by clearing L4, so we could pass exactly
@@ -1186,15 +1900,272 @@ class TitleScene extends Phaser.Scene {
       });
     };
 
-    // Pill row: L1..L4 + final-battle. In dev mode all five always render.
-    // In prod mode each pill is gated by save state - locked entries are
-    // hidden entirely (no dimmed placeholder), per design call.
+    /* ----- view containers (toggled by showView) ----- */
+    this.mainMenuContainer = this.add.container(0, 0);
+    this.optionsContainer  = this.add.container(0, 0);
+    this.goodbyeContainer  = this.add.container(0, 0);
+
+    this.allPills = this.buildAllPillsDef(save);
+    this.buildMainMenuView(W, H);
+    this.buildOptionsView(W, H);
+    this.buildGoodbyeView(W, H);
+
+    this.showView('main');
+
+    /* ----- persistent footer (visible on main + options) ----- */
+    this.buildFooter(W, H);
+
+    /* ----- keyboard shortcuts (work from main + options) ----- */
+    this.bindKeyboardShortcuts();
+  }
+
+  /* ----- forest backdrop (same vocabulary as IntroScene) ----- */
+  drawForestBackground(W, H) {
+    const sky = this.add.graphics();
+    for (let y = 0; y < H; y += 4) {
+      const t = y / H;
+      const r = Math.floor(120 + (1 - t) * 80);
+      const gr = Math.floor(170 + (1 - t) * 40);
+      const b = Math.floor(190 - t * 60);
+      sky.fillStyle((r << 16) | (gr << 8) | b, 1);
+      sky.fillRect(0, y, W, 4);
+    }
+    sky.fillStyle(0xfff5c4, 0.10);
+    for (let i = 0; i < 6; i++) {
+      const x = (W / 6) * i + 30;
+      sky.fillTriangle(x, 0, x - 40, H, x + 40, H);
+    }
+
+    const treeBand = this.add.graphics();
+    for (let i = 0; i < 8; i++) {
+      const cx = (W / 8) * i + 45;
+      const cy = H * 0.55;
+      treeBand.fillStyle(0x3a2616, 1);
+      treeBand.fillRect(cx - 8, cy - 2, 16, 36);
+      treeBand.fillStyle(0x1f4a14, 1);
+      treeBand.fillCircle(cx, cy - 28, 32);
+      treeBand.fillCircle(cx - 18, cy - 20, 24);
+      treeBand.fillCircle(cx + 18, cy - 20, 24);
+      treeBand.fillStyle(0x2f6a1c, 1);
+      treeBand.fillCircle(cx - 6, cy - 34, 18);
+      treeBand.fillCircle(cx + 10, cy - 32, 16);
+    }
+
+    const floor = this.add.graphics();
+    floor.fillStyle(0x2a4a1a, 1);
+    floor.fillRect(0, H * 0.55, W, H * 0.45);
+    floor.fillStyle(0x1f3a14, 0.55);
+    for (let i = 0; i < 50; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(Math.round(H * 0.56), H);
+      const r = Phaser.Math.Between(20, 60);
+      floor.fillCircle(x, y, r);
+    }
+
+    const scatter = this.add.graphics();
+    for (let i = 0; i < 80; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(Math.round(H * 0.58), H - 10);
+      const kind = Math.random();
+      if (kind < 0.55) {
+        scatter.lineStyle(2, 0x6db84a, 0.85);
+        scatter.lineBetween(x - 3, y + 4, x - 3, y - 2);
+        scatter.lineBetween(x,     y + 4, x,     y - 4);
+        scatter.lineBetween(x + 3, y + 4, x + 3, y - 1);
+      } else if (kind < 0.85) {
+        scatter.fillStyle(0x4a8c2e, 0.85);
+        scatter.fillCircle(x, y, 4);
+        scatter.fillCircle(x + 4, y - 1, 3);
+        scatter.fillCircle(x - 4, y - 1, 3);
+      } else {
+        scatter.fillStyle(0xfff8e8, 1);
+        scatter.fillRect(x - 1, y, 2, 4);
+        scatter.fillStyle(0xc8323a, 1);
+        scatter.fillCircle(x, y, 3);
+      }
+    }
+
+    // Subtle twinkly sparkles in the canopy / sky for some life. We use
+    // a static set (no per-frame update on the title screen) - one tween
+    // per sparkle keeps the cost bounded.
+    for (let i = 0; i < 14; i++) {
+      const sx = Phaser.Math.Between(40, W - 40);
+      const sy = Phaser.Math.Between(80, Math.round(H * 0.55));
+      const s = this.add.graphics();
+      s.fillStyle(0xfff5c4, 0.7);
+      s.fillCircle(sx, sy, 1.5);
+      s.setAlpha(0.3);
+      this.tweens.add({
+        targets: s, alpha: 0.95,
+        duration: 800 + i * 90,
+        yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+      });
+    }
+  }
+
+  /* ----- pixel-style menu button ----- */
+  makePixelButton(x, y, label, opts = {}) {
+    const BTN_W   = opts.width  ?? 280;
+    const BTN_H   = opts.height ?? 54;
+    const fontPx  = opts.fontSize ?? '14px';
+    const accent  = opts.accent ?? 0xfde58c;     // border + hover fill
+    const dim     = opts.dim    ?? 0x0a0610;     // resting fill
+    const textCol = opts.color  ?? '#fde58c';
+
+    const btn = this.add.container(x, y);
+    const bg = this.add.graphics();
+    const drawBg = (hover) => {
+      bg.clear();
+      bg.fillStyle(hover ? accent : dim, hover ? 1 : 0.92);
+      bg.fillRoundedRect(-BTN_W / 2, -BTN_H / 2, BTN_W, BTN_H, 8);
+      bg.lineStyle(3, accent, 1);
+      bg.strokeRoundedRect(-BTN_W / 2, -BTN_H / 2, BTN_W, BTN_H, 8);
+      bg.lineStyle(1, 0xffe066, 0.55);
+      bg.strokeRoundedRect(-BTN_W / 2 + 5, -BTN_H / 2 + 5, BTN_W - 10, BTN_H - 10, 6);
+    };
+    drawBg(false);
+
+    const text = this.add.text(0, 0, label, {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: fontPx,
+      color: textCol,
+      stroke: '#1a0a08',
+      strokeThickness: 3,
+      align: 'center',
+    }).setOrigin(0.5);
+
+    btn.add([bg, text]);
+    btn.setSize(BTN_W, BTN_H);
+    btn.setInteractive({ useHandCursor: true });
+    btn.on('pointerover', () => { drawBg(true); text.setColor('#1a0a08'); });
+    btn.on('pointerout',  () => { drawBg(false); text.setColor(textCol); });
+    btn.on('pointerdown', () => { if (opts.onClick) opts.onClick(); });
+
+    return btn;
+  }
+
+  /* ----- main menu view (Start Game / Options / Exit) ----- */
+  buildMainMenuView(W, H) {
+    const c = this.mainMenuContainer;
+    const startBtn = this.makePixelButton(W / 2, H * 0.50, 'START GAME', {
+      onClick: () => {
+        // "Start Game" = play from the beginning. In dev mode this still
+        // works as a quick L1 launch.
+        this._launch(1);
+      },
+    });
+    const optsBtn = this.makePixelButton(W / 2, H * 0.64, 'OPTIONS', {
+      onClick: () => this.showView('options'),
+    });
+    const exitBtn = this.makePixelButton(W / 2, H * 0.78, 'EXIT', {
+      // Browsers block window.close() on user-opened tabs (which is how
+      // most family members will visit), so the click shows a graceful
+      // goodbye screen instead of failing silently.
+      onClick: () => this.showView('goodbye'),
+    });
+    c.add([startBtn, optsBtn, exitBtn]);
+  }
+
+  /* ----- options view (level select, mirrors the old pill row) ----- */
+  buildOptionsView(W, H) {
+    const c = this.optionsContainer;
+
+    // Subtitle
+    const subtitle = this.add.text(W / 2, H * 0.40, 'SELECT A LEVEL', {
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '14px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 3,
+    }).setOrigin(0.5);
+    const hint = this.add.text(W / 2, H * 0.46,
+      'WASD / arrows to move \u00b7 drag the left side on mobile', {
+        fontFamily: 'system-ui, sans-serif', fontSize: '12px', color: '#dddddd',
+      }).setOrigin(0.5);
+    c.add([subtitle, hint]);
+
+    // Level pills (existing styling preserved)
+    const visiblePills = this.allPills.filter((p) => p.unlocked);
     const PILL_W = 144;
     const PILL_H = 76;
     const PILL_GAP = 14;
-    const pillY = H * 0.85;
+    const pillY = H * 0.62;
+    const rowW = visiblePills.length * PILL_W
+      + Math.max(0, visiblePills.length - 1) * PILL_GAP;
+    const rowStartX = W / 2 - rowW / 2 + PILL_W / 2;
+    visiblePills.forEach((def, i) => {
+      const x = rowStartX + i * (PILL_W + PILL_GAP);
+      const pill = this.makeLevelPill(x, pillY, def, PILL_W, PILL_H);
+      c.add(pill);
+    });
 
-    const allPills = [
+    // Back button at the bottom
+    const backBtn = this.makePixelButton(W / 2, H * 0.85, '\u2190 BACK', {
+      width: 180, height: 44, fontSize: '12px',
+      onClick: () => this.showView('main'),
+    });
+    c.add(backBtn);
+  }
+
+  /* ----- pill (level / boss) ----- */
+  makeLevelPill(xCenter, yCenter, def, PILL_W, PILL_H) {
+    const btn = this.add.container(xCenter, yCenter);
+    const bg = this.add.graphics();
+    const drawBg = (hover) => {
+      bg.clear();
+      bg.fillStyle(hover ? def.color : 0x1a0f1f, 1);
+      bg.fillRoundedRect(-PILL_W / 2, -PILL_H / 2, PILL_W, PILL_H, 12);
+      bg.lineStyle(3, hover ? 0xffe066 : def.color, 1);
+      bg.strokeRoundedRect(-PILL_W / 2, -PILL_H / 2, PILL_W, PILL_H, 12);
+    };
+    drawBg(false);
+
+    const isBoss = def.kind === 'boss';
+    const tag = this.add.text(0, -22, isBoss ? 'FINAL BATTLE' : `LEVEL ${def.id}`, {
+      fontFamily: '"Press Start 2P", Impact, Charcoal, sans-serif',
+      fontSize: isBoss ? '9px' : '10px',
+      color: isBoss ? '#ffd54a' : '#ffe066',
+    }).setOrigin(0.5);
+    const name = this.add.text(0, 4, def.label, {
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      fontSize: '11px', color: '#ffffff',
+      align: 'center', wordWrap: { width: PILL_W - 16, useAdvancedWrap: true },
+    }).setOrigin(0.5);
+    const hintText = isBoss ? 'Press B' : `Press ${def.id}`;
+    const hint = this.add.text(0, 26, hintText, {
+      fontFamily: 'system-ui, sans-serif',
+      fontSize: '9px', color: '#aaaaaa',
+    }).setOrigin(0.5);
+
+    btn.add([bg, tag, name, hint]);
+    btn.setSize(PILL_W, PILL_H);
+    btn.setInteractive({ useHandCursor: true });
+
+    btn.on('pointerover', () => {
+      drawBg(true);
+      tag.setColor('#1a0f1f');
+      name.setColor('#1a0f1f');
+      hint.setColor('#1a0f1f');
+    });
+    btn.on('pointerout', () => {
+      drawBg(false);
+      tag.setColor(isBoss ? '#ffd54a' : '#ffe066');
+      name.setColor('#ffffff');
+      hint.setColor('#aaaaaa');
+    });
+    btn.on('pointerdown', () => {
+      if (isBoss) this._launchBoss();
+      else this._launch(def.id);
+    });
+
+    this.tweens.add({
+      targets: btn, scale: 1.04,
+      duration: 1100 + (typeof def.id === 'number' ? def.id * 80 : 480),
+      yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+    });
+    return btn;
+  }
+
+  buildAllPillsDef(save) {
+    return [
       { kind: 'level', id: 1, label: 'The Whirling Halls', color: 0x9c6bff,
         unlocked: DEV_MODE || save.lastClearedLevel + 1 >= 1 },
       { kind: 'level', id: 2, label: 'The Falling Sky',    color: 0xff7a3a,
@@ -1206,137 +2177,117 @@ class TitleScene extends Phaser.Scene {
       { kind: 'boss',  id: 'boss', label: 'Los Hackers',   color: 0xff3a3a,
         unlocked: DEV_MODE || save.lastClearedLevel >= 4 },
     ];
-    const visiblePills = allPills.filter((p) => p.unlocked);
+  }
 
-    // Recenter the row so however many pills are visible look balanced.
-    // E.g. on a fresh save in prod mode, only L1 shows and it sits centered;
-    // dev mode (and a fully-cleared prod save) gets all five with even
-    // spacing.
-    const rowW = visiblePills.length * PILL_W
-      + Math.max(0, visiblePills.length - 1) * PILL_GAP;
-    const rowStartX = W / 2 - rowW / 2 + PILL_W / 2;
+  /* ----- goodbye view (Exit button destination) ----- */
+  buildGoodbyeView(W, H) {
+    const c = this.goodbyeContainer;
+    const overlay = this.add.graphics();
+    overlay.fillStyle(0x000000, 0.92);
+    overlay.fillRect(0, 0, W, H);
+    const headline = this.add.text(W / 2, H * 0.42, 'THANKS\nFOR PLAYING.', {
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '22px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 4,
+      align: 'center', lineSpacing: 12,
+    }).setOrigin(0.5);
+    const note = this.add.text(W / 2, H * 0.62, 'You can close this tab now.', {
+      fontFamily: 'system-ui, sans-serif',
+      fontSize: '14px', color: '#cccccc',
+    }).setOrigin(0.5);
+    const longLive = this.add.text(W / 2, H * 0.74, 'long live the brainrots.', {
+      fontFamily: 'Georgia, serif', fontStyle: 'italic',
+      fontSize: '13px', color: '#888888',
+    }).setOrigin(0.5);
+    // Quiet Back-to-title affordance, just in case the player changed
+    // their mind. Pixel font, dim, bottom-left so it doesn't feel like
+    // the primary path.
+    const back = this.add.text(W / 2, H * 0.86, '\u2190 back', {
+      fontFamily: '"Press Start 2P", system-ui, sans-serif',
+      fontSize: '10px', color: '#888888',
+    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    back.on('pointerover', () => back.setColor('#fde58c'));
+    back.on('pointerout',  () => back.setColor('#888888'));
+    back.on('pointerdown', () => this.showView('main'));
+    c.add([overlay, headline, note, longLive, back]);
+  }
 
-    const makePill = (xCenter, def) => {
-      const btn = this.add.container(xCenter, pillY);
-      const bg = this.add.graphics();
-      const drawBg = (hover) => {
-        bg.clear();
-        bg.fillStyle(hover ? def.color : 0x1a0f1f, 1);
-        bg.fillRoundedRect(-PILL_W / 2, -PILL_H / 2, PILL_W, PILL_H, 12);
-        bg.lineStyle(3, hover ? 0xffe066 : def.color, 1);
-        bg.strokeRoundedRect(-PILL_W / 2, -PILL_H / 2, PILL_W, PILL_H, 12);
-      };
-      drawBg(false);
-
-      const isBoss = def.kind === 'boss';
-      const tag = this.add.text(0, -18, isBoss ? 'FINAL BATTLE' : `LEVEL ${def.id}`, {
-        fontFamily: 'Impact, Charcoal, sans-serif',
-        fontSize: isBoss ? '15px' : '18px',
-        color: isBoss ? '#ffd54a' : '#ffe066',
-      }).setOrigin(0.5);
-      const name = this.add.text(0, 6, def.label, {
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: '11px', color: '#ffffff',
-        align: 'center', wordWrap: { width: PILL_W - 16, useAdvancedWrap: true },
-      }).setOrigin(0.5);
-      const hintText = isBoss
-        ? 'Press B'
-        : `Press ${def.id}`;
-      const hint = this.add.text(0, 26, hintText, {
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: '9px', color: '#aaaaaa',
-      }).setOrigin(0.5);
-      btn.add([bg, tag, name, hint]);
-      btn.setSize(PILL_W, PILL_H);
-      btn.setInteractive({ useHandCursor: true });
-
-      btn.on('pointerover', () => {
-        drawBg(true);
-        tag.setColor('#1a0f1f');
-        name.setColor('#1a0f1f');
-        hint.setColor('#1a0f1f');
-      });
-      btn.on('pointerout', () => {
-        drawBg(false);
-        tag.setColor(isBoss ? '#ffd54a' : '#ffe066');
-        name.setColor('#ffffff');
-        hint.setColor('#aaaaaa');
-      });
-      btn.on('pointerdown', () => {
-        if (isBoss) launchBoss();
-        else launch(def.id);
-      });
-
-      this.tweens.add({
-        targets: btn, scale: 1.04,
-        duration: 1100 + (typeof def.id === 'number' ? def.id * 80 : 480),
-        yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
-      });
-      return btn;
-    };
-
-    visiblePills.forEach((def, i) => {
-      const x = rowStartX + i * (PILL_W + PILL_GAP);
-      makePill(x, def);
+  /* ----- footer (replay intro + dev hint, persists on main + options) ----- */
+  buildFooter(W, H) {
+    // Small pixel-font "replay intro" link in the bottom-left. Bypasses
+    // the introSeen gate via { force: true }.
+    const replayLink = this.add.text(8, H - 4, '\u25B8 replay intro', {
+      fontFamily: '"Press Start 2P", system-ui, sans-serif',
+      fontSize: '9px', color: '#cccccc',
+    }).setOrigin(0, 1).setInteractive({ useHandCursor: true }).setDepth(50);
+    replayLink.on('pointerover', () => replayLink.setColor('#ffe066'));
+    replayLink.on('pointerout',  () => replayLink.setColor('#cccccc'));
+    replayLink.on('pointerdown', () => {
+      this.scene.start('Intro', { force: true });
     });
+    this.replayLink = replayLink;
 
-    // Keyboard shortcuts only fire if that pill is currently unlocked, so
-    // a fresh prod-mode save can't `Press 4` straight into a locked level.
+    if (DEV_MODE) {
+      this.devHint = this.add.text(W - 8, H - 4,
+        'dev: Shift+1..4 first-clear modal \u00b7 Alt+Shift+1..4 replay modal \u00b7 B boss \u00b7 clear save: localStorage.removeItem("'
+          + SAVE_KEY + '")',
+        { fontFamily: 'system-ui', fontSize: '9px', color: '#5a4f6a' }
+      ).setOrigin(1, 1).setDepth(50);
+    }
+  }
+
+  /* ----- view switching ----- */
+  showView(name) {
+    this.currentView = name;
+    if (this.mainMenuContainer) this.mainMenuContainer.setVisible(name === 'main');
+    if (this.optionsContainer)  this.optionsContainer.setVisible(name === 'options');
+    if (this.goodbyeContainer)  this.goodbyeContainer.setVisible(name === 'goodbye');
+    // Footer fades out on the goodbye screen (it's the end of the journey).
+    const showFooter = name !== 'goodbye';
+    if (this.replayLink) this.replayLink.setVisible(showFooter);
+    if (this.devHint)    this.devHint.setVisible(showFooter);
+  }
+
+  /* ----- keyboard shortcuts ----- */
+  bindKeyboardShortcuts() {
     const launchIfUnlocked = (levelId) => {
-      const def = allPills.find((p) => p.id === levelId);
-      if (def?.unlocked) launch(levelId);
+      const def = this.allPills.find((p) => p.id === levelId);
+      if (def?.unlocked) this._launch(levelId);
     };
-    this.input.keyboard.once('keydown-SPACE', () => launchIfUnlocked(1));
-    this.input.keyboard.once('keydown-ENTER', () => launchIfUnlocked(1));
+    // Space / Enter on main menu = Start Game (L1).
+    this.input.keyboard.once('keydown-SPACE', () => {
+      if (this.currentView === 'goodbye') return;
+      launchIfUnlocked(1);
+    });
+    this.input.keyboard.once('keydown-ENTER', () => {
+      if (this.currentView === 'goodbye') return;
+      launchIfUnlocked(1);
+    });
+    // ESC: from options -> main, from goodbye -> main, from main -> no-op.
+    this.input.keyboard.on('keydown-ESC', () => {
+      if (this.currentView === 'options') this.showView('main');
+      else if (this.currentView === 'goodbye') this.showView('main');
+    });
     // Number key launches that level. Shift + number opens the level-complete
-    // MODAL preview without playing the level - dev convenience for tuning
-    // the win banner copy / layout. Two preview flavors:
-    //   Shift + N        → first-clear layout (saved line + 2 buttons)
-    //   Shift + Alt + N  → replay layout (single "Back to main", no saved line)
+    // MODAL preview without playing the level (dev convenience).
     const launchModalPreview = (levelId, mode) => {
       Sfx.init(); Sfx.resume(); Sfx.play('portal');
       this.scene.start('Game', { levelId, previewModal: true, previewMode: mode });
     };
     const numberHandler = (id) => (e) => {
-      if (e?.shiftKey) {
-        launchModalPreview(id, e.altKey ? 'replay' : 'first-clear');
-      } else {
-        launch(id);
-      }
+      if (this.currentView === 'goodbye') return;
+      if (e?.shiftKey) launchModalPreview(id, e.altKey ? 'replay' : 'first-clear');
+      else this._launch(id);
     };
     this.input.keyboard.on('keydown-ONE',   numberHandler(1));
     this.input.keyboard.on('keydown-TWO',   numberHandler(2));
     this.input.keyboard.on('keydown-THREE', numberHandler(3));
     this.input.keyboard.on('keydown-FOUR',  numberHandler(4));
-
-    // Keyboard shortcut to the boss arena. Only fires if the boss pill is
-    // currently unlocked (always true in dev mode; prod mode requires
-    // lastClearedLevel >= 4).
     this.input.keyboard.on('keydown-B', () => {
-      const bossDef = allPills.find((p) => p.kind === 'boss');
-      if (bossDef?.unlocked) launchBoss();
+      if (this.currentView === 'goodbye') return;
+      const bossDef = this.allPills.find((p) => p.kind === 'boss');
+      if (bossDef?.unlocked) this._launchBoss();
     });
-    // The old bottom-right "⚡ BOSS (dev)" pill was a stand-in until
-    // persistent progress landed. It's now replaced by the fifth pill in
-    // the level row (which gates on save state in prod mode and renders
-    // unconditionally in dev mode), so the temporary block is gone.
-
-    this.add.text(W / 2, H - 16,
-      'WASD / arrows to move on desktop - drag the left side on mobile',
-      { fontFamily: 'system-ui', fontSize: '13px', color: '#aaaaaa' }
-    ).setOrigin(0.5, 1);
-
-    // Tiny dev hint, deliberately small + low-contrast so it doesn't compete
-    // with the level buttons but is discoverable for review purposes. Only
-    // shown in dev mode - in prod mode this would just clutter the title
-    // for family members who'll never use these shortcuts.
-    if (DEV_MODE) {
-      this.add.text(W - 8, H - 4,
-        'dev: Shift+1..4 first-clear modal · Alt+Shift+1..4 replay modal · B boss · clear save: localStorage.removeItem("'
-          + SAVE_KEY + '")',
-        { fontFamily: 'system-ui', fontSize: '9px', color: '#5a4f6a' }
-      ).setOrigin(1, 1);
-    }
   }
 }
 
@@ -3311,9 +4262,9 @@ class GameScene extends Phaser.Scene {
     this.redrawBase();
 
     this.baseLabel = this.add.text(x, y - 60, 'BASE', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '14px', color: '#cbb3ff',
-      stroke: '#1a0f1f', strokeThickness: 3,
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '10px', color: '#cbb3ff',
+      stroke: '#1a0a08', strokeThickness: 3,
     }).setOrigin(0.5);
     this.baseLabel.setDepth(y - 60);
 
@@ -3442,9 +4393,10 @@ class GameScene extends Phaser.Scene {
       sprite.setDepth(py);
 
       const label = this.add.text(px, py + 34, data.name, {
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: '11px', color: '#ffe066',
-        stroke: '#1a0f1f', strokeThickness: 3,
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: '8px', color: '#fde58c',
+        stroke: '#1a0a08', strokeThickness: 3,
+        align: 'center',
       }).setOrigin(0.5).setAlpha(0);
       label.setDepth(py + 1);
 
@@ -3660,12 +4612,13 @@ class GameScene extends Phaser.Scene {
     bg.lineStyle(3, 0xffe066, 0.85);
     bg.strokeCircle(0, 0, visualR);
     const label = this.add.text(0, -2, 'JUMP', {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '18px', color: '#ffe066',
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '11px', color: '#ffe066',
+      stroke: '#1a0a08', strokeThickness: 3,
     }).setOrigin(0.5);
     const hint = this.add.text(0, 18, '(space)', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '9px', color: '#cbb3ff',
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '7px', color: '#cbb3ff',
     }).setOrigin(0.5);
     this.jumpBtnBg = bg;
     this.jumpBtnLabel = label;
@@ -3727,33 +4680,38 @@ class GameScene extends Phaser.Scene {
   /* ----- HUD ----- */
 
   createHUD() {
-    this.hudCollected = this.add.text(12, 8, 'Collected: 0 / 5', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '18px', color: '#ffe066',
-      stroke: '#1a0f1f', strokeThickness: 4,
+    this.hudCollected = this.add.text(12, 8, 'Collected 0/5', {
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '12px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 4,
     }).setScrollFactor(0).setDepth(10000);
 
-    this.hudLevel = this.add.text(12, 32, `Lv ${this.levelId} - ${this.levelConfig.name}`, {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '12px', color: '#cbb3ff',
-      stroke: '#1a0f1f', strokeThickness: 3,
+    this.hudLevel = this.add.text(12, 30, `Lv ${this.levelId} - ${this.levelConfig.name}`, {
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '9px', color: '#cbb3ff',
+      stroke: '#1a0a08', strokeThickness: 3,
     }).setScrollFactor(0).setDepth(10000);
 
-    this.hudCarried = this.add.text(GAME_W - 12, 8, '🎒 0', {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '18px', color: '#ffffff',
-      stroke: '#1a0f1f', strokeThickness: 4,
+    this.hudCarried = this.add.text(GAME_W - 12, 8, 'BAG 0', {
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '12px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 4,
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(10000);
 
+    // Pixel-art hearts replace the emoji ❤️ to match the pixel-font HUD.
+    // Containers (not text) so they tween cleanly via loseHeart() and
+    // can be alpha-dimmed on hits.
     this.hudHearts = [];
     const heartSpacing = 34;
+    const heartPx = 4;
+    const heartH = PIXEL_HEART_PATTERN.length * heartPx;
     const heartsTotalWidth = (STARTING_HEARTS - 1) * heartSpacing;
     const heartStartX = GAME_W / 2 - heartsTotalWidth / 2;
+    const heartCenterY = 14 + heartH / 2;
     for (let i = 0; i < STARTING_HEARTS; i++) {
-      const h = this.add.text(heartStartX + i * heartSpacing, 14, '❤️', {
-        fontSize: '26px',
+      const h = makePixelHeart(this, heartStartX + i * heartSpacing, heartCenterY, {
+        px: heartPx,
       })
-        .setOrigin(0.5, 0)
         .setScrollFactor(0)
         .setDepth(10000);
       if (i >= this.hearts) h.setAlpha(0.2);
@@ -3762,21 +4720,40 @@ class GameScene extends Phaser.Scene {
   }
 
   flashText(message, durationMs = 1500) {
-    const t = this.add.text(GAME_W / 2, 50, message, {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '20px', color: '#ffffff',
-      backgroundColor: '#1a0f1fcc',
-      padding: { x: 14, y: 8 },
-    }).setOrigin(0.5).setScrollFactor(0).setDepth(10001);
-    // Banner is screen-locked HUD (depth 10001) - keep it off the zoomed
-    // gameplay and skybox cameras immediately (the addedtoscene partitioner
-    // runs one tick later, which would otherwise render this banner
-    // enlarged for a single frame).
-    if (this.cameras && this.cameras.main) this.cameras.main.ignore(t);
-    if (this.skyCamera) this.skyCamera.ignore(t);
+    // Zelda-style flash: pixel-font cream-gold text on a dark plum slab
+    // with a thin gold border. Same banner mechanics as before (top-of-
+    // screen, fades, ignored by world + sky cameras), just dressed to
+    // match the narrative cards and the title menu.
+    const padX = 18;
+    const padY = 12;
+    const text = this.add.text(GAME_W / 2, 50, message, {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '12px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 3,
+      align: 'center', lineSpacing: 4,
+      wordWrap: { width: GAME_W - 80, useAdvancedWrap: true },
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(10002);
+    const tw = text.width + padX * 2;
+    const th = text.height + padY * 2;
+    const box = this.add.graphics().setScrollFactor(0).setDepth(10001);
+    box.fillStyle(0x0a0610, 0.92);
+    box.fillRoundedRect(GAME_W / 2 - tw / 2, 50 - th / 2, tw, th, 8);
+    box.lineStyle(2, 0xfde58c, 0.9);
+    box.strokeRoundedRect(GAME_W / 2 - tw / 2, 50 - th / 2, tw, th, 8);
+    box.lineStyle(1, 0xffe066, 0.45);
+    box.strokeRoundedRect(GAME_W / 2 - tw / 2 + 4, 50 - th / 2 + 4, tw - 8, th - 8, 6);
+
+    if (this.cameras && this.cameras.main) {
+      this.cameras.main.ignore(text);
+      this.cameras.main.ignore(box);
+    }
+    if (this.skyCamera) {
+      this.skyCamera.ignore(text);
+      this.skyCamera.ignore(box);
+    }
     this.tweens.add({
-      targets: t, alpha: 0, duration: 400, delay: durationMs,
-      onComplete: () => t.destroy(),
+      targets: [text, box], alpha: 0, duration: 400, delay: durationMs,
+      onComplete: () => { text.destroy(); box.destroy(); },
     });
   }
 
@@ -5120,8 +6097,8 @@ class GameScene extends Phaser.Scene {
 
   updateCarriedHud() {
     const n = this.carried.length;
-    this.hudCarried.setText('🎒 ' + n);
-    this.hudCollected.setText('Collected: ' + this.deposited.size + ' / 5');
+    this.hudCarried.setText('BAG ' + n);
+    this.hudCollected.setText('Collected ' + this.deposited.size + '/5');
 
     let color = '#ffffff';
     let scale = 1;
@@ -5216,28 +6193,19 @@ class GameScene extends Phaser.Scene {
         nextPayload = { levelId: nextLevelId, allDeposited: cumulative };
       }
     } else {
-      const requiredUltimates = Object.values(LEVELS)
-        .map((lv) => lv.ultimateId)
-        .filter(Boolean);
-      const allUltimatesCollected = requiredUltimates.every((id) => cumulative.includes(id));
-      if (allUltimatesCollected) {
-        nextButtonLabel = 'Enter the Final Battle ⚡';
-        if (this.isModalPreview) {
-          nextRoute = 'Title';
-          nextPayload = {};
-        } else {
-          nextRoute = 'Boss';
-          nextPayload = { allDeposited: cumulative };
-        }
+      // L4 first-clear (or any non-replay clear with no nextLevelId): always
+      // hand off to the boss. The "View Roster" branch used to surface here
+      // when `cumulative` was missing ultimates - which only ever happened
+      // via the dev `Shift+4` modal preview shortcut - so it was effectively
+      // a dev-only artifact that real players never saw. Collapsed to a
+      // single "Final Battle" CTA.
+      nextButtonLabel = 'Final Battle';
+      if (this.isModalPreview) {
+        nextRoute = 'Title';
+        nextPayload = {};
       } else {
-        nextButtonLabel = 'View Roster';
-        if (this.isModalPreview) {
-          nextRoute = 'Title';
-          nextPayload = {};
-        } else {
-          nextRoute = 'Win';
-          nextPayload = { allDeposited: cumulative };
-        }
+        nextRoute = 'Boss';
+        nextPayload = { allDeposited: cumulative };
       }
     }
 
@@ -5282,7 +6250,6 @@ class GameScene extends Phaser.Scene {
       return obj;
     };
 
-    // Track every object for the entrance fade + cleanup.
     const elements = [];
     const add = (obj) => {
       lockToUi(obj);
@@ -5293,11 +6260,13 @@ class GameScene extends Phaser.Scene {
     // Backdrop: full-screen dark veil that also swallows clicks so the player
     // can't accidentally interact with the frozen level beneath the modal.
     const backdrop = add(this.add.rectangle(W / 2, H / 2, W, H, 0x05050a, 0.78));
-    backdrop.setInteractive();      // swallow input on the world
+    backdrop.setInteractive();
 
-    // Card panel - centered, sized to comfortably hold the celebration block.
+    // Card panel - centered. Sized smaller now that the superpower
+    // description is gone (the per-level modal is no longer the place
+    // to teach ultimates - they only matter in the final battle).
     const cardW = Math.min(560, W - 40);
-    const cardH = Math.min(560, H - 40);
+    const cardH = Math.min(440, H - 40);
     const cardX = W / 2;
     const cardY = H / 2;
 
@@ -5305,118 +6274,108 @@ class GameScene extends Phaser.Scene {
     // Drop shadow
     card.fillStyle(0x000000, 0.55);
     card.fillRoundedRect(cardX - cardW / 2 + 6, cardY - cardH / 2 + 8, cardW, cardH, 22);
-    // Body
-    card.fillStyle(0x1a0f1f, 0.97);
+    // Body - keeps the dark plum so the gold border + cream pixel text pop.
+    card.fillStyle(0x0a0610, 0.97);
     card.fillRoundedRect(cardX - cardW / 2, cardY - cardH / 2, cardW, cardH, 22);
-    // Gold border
-    card.lineStyle(3, 0xffe066, 0.95);
+    // Gold border (matches the intro/outro Zelda-style cards)
+    card.lineStyle(3, 0xfde58c, 0.95);
     card.strokeRoundedRect(cardX - cardW / 2, cardY - cardH / 2, cardW, cardH, 22);
+    // Inner thin gold rim for depth (same trick as the title menu buttons
+    // and the narrative cards).
+    card.lineStyle(1, 0xffe066, 0.55);
+    card.strokeRoundedRect(cardX - cardW / 2 + 5, cardY - cardH / 2 + 5, cardW - 10, cardH - 10, 18);
 
-    // Top of card: confetti/sparkle band for celebration.
-    for (let i = 0; i < 16; i++) {
-      const t = add(this.add.text(
-        cardX - cardW / 2 + 24 + ((cardW - 48) / 16) * i,
-        cardY - cardH / 2 + 26,
-        ['✨', '🎉', '⭐', '✨'][i % 4],
-        { fontSize: '18px' },
-      ).setOrigin(0.5));
-      this.tweens.add({
-        targets: t,
-        y: t.y - 6,
-        duration: 700 + (i % 4) * 100,
-        yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
-      });
-    }
-
-    // Header. Replay runs use a slightly less-shouty headline since the
-    // player isn't unlocking anything new this run.
-    add(this.add.text(cardX, cardY - cardH / 2 + 64,
+    // Header (pixel font). Replay runs use a slightly less-shouty headline
+    // since the player isn't unlocking anything new.
+    add(this.add.text(cardX, cardY - cardH / 2 + 36,
       isReplay ? `LEVEL ${this.levelId} CLEARED AGAIN!` : `LEVEL ${this.levelId} COMPLETE!`, {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '38px', color: '#ffe066',
-      stroke: '#1a0f1f', strokeThickness: 5,
-      letterSpacing: 2,
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '17px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 4,
+      align: 'center',
     }).setOrigin(0.5));
 
-    // Subtitle / congrats line. Replay runs note that the ultimate is
-    // already in the player's collection so they don't expect a new
-    // unlock; first clears keep the celebratory "captured a new
-    // ultimate" framing.
-    add(this.add.text(cardX, cardY - cardH / 2 + 102,
+    // Subtitle / congrats line (pixel font, small enough to keep one-liner
+    // weight on the headline). wordWrap covers longer replay copy.
+    add(this.add.text(cardX, cardY - cardH / 2 + 76,
       isReplay
-        ? `Nice run! This ultimate is already in your collection.`
+        ? `This ultimate is already in your collection.`
         : `You captured a new ultimate brainrot!`, {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '15px', color: '#cbb3ff',
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '10px', color: '#cbb3ff',
+      stroke: '#1a0a08', strokeThickness: 2,
+      align: 'center', lineSpacing: 4,
+      wordWrap: { width: cardW - 80, useAdvancedWrap: true },
     }).setOrigin(0.5));
 
-    // Ultimate brainrot showcase.
+    // Buttons sit at the bottom of the card. Layout is driven by isReplay
+    // (not nextRoute) so that dev modal previews still get to render the
+    // first-clear layout even though their right-button routes back to
+    // Title under the hood.
+    const btnH = 50;
+    const btnY = cardY + cardH / 2 - 38;
+    const isSingleBtn = isReplay;
+
+    // Vertically center the {portrait + name + (optional) saved-line}
+    // block in the open space between the subtitle bottom and the button
+    // top, so the celebration doesn't visually drift toward either edge
+    // (and so the saved-line + name + portrait read as one group instead
+    // of saved-line floating against the buttons).
+    const subtitleY = cardY - cardH / 2 + 76;
+    const subtitleBottomY = subtitleY + 8;          // ~half the subtitle text height
+    const btnTopY = btnY - btnH / 2;
+    const blockCenterY = (subtitleBottomY + btnTopY) / 2;
+
+    const portraitH = 140;
+    const gapPortraitToName = 22;
+    const nameH = 14;
+    const gapNameToSaved = 22;
+    const savedH = 10;
+
+    const showSaved = !isReplay;
+    const blockH = portraitH + gapPortraitToName + nameH
+      + (showSaved ? gapNameToSaved + savedH : 0);
+    const blockTopY = blockCenterY - blockH / 2;
+    const portraitY = blockTopY + portraitH / 2;
+    const nameY = portraitY + portraitH / 2 + gapPortraitToName + nameH / 2;
+    const savedY = nameY + nameH / 2 + gapNameToSaved + savedH / 2;
+
+    // Ultimate brainrot showcase. Sprite (or emoji fallback) + name only -
+    // the superpower description was removed since ultimates aren't
+    // wielded in the per-level loop; their explanations belong in the
+    // final battle hand-off, not here.
     if (ultimate) {
-      // Sprite (or emoji fallback). No glow disc behind it - the plain
-      // background reads cleaner and isn't visually distracting. Sprite
-      // sits a bit higher (-40 from card center) to make room for the
-      // larger 170×170 portrait without crowding the brainrot name below.
       let portrait;
       if (ultimate.spriteKey && this.textures.exists(ultimate.spriteKey)) {
-        portrait = add(this.add.image(cardX, cardY - 40, ultimate.spriteKey)
+        portrait = add(this.add.image(cardX, portraitY, ultimate.spriteKey)
           .setOrigin(0.5)
-          .setDisplaySize(170, 170));
+          .setDisplaySize(portraitH, portraitH));
       } else {
-        portrait = add(this.add.text(cardX, cardY - 40,
+        portrait = add(this.add.text(cardX, portraitY,
           `${ultimate.emoji}${ultimate.accent || ''}`,
-          { fontSize: '128px' }
+          { fontSize: '108px' }
         ).setOrigin(0.5));
       }
 
-      // Brainrot name.
-      add(this.add.text(cardX, cardY + 56, ultimate.name.toUpperCase(), {
-        fontFamily: 'Impact, Charcoal, sans-serif',
-        fontSize: '22px', color: '#ffffff',
-        stroke: '#1a0f1f', strokeThickness: 4,
-        letterSpacing: 1,
+      // Brainrot name (pixel font).
+      add(this.add.text(cardX, nameY, ultimate.name.toUpperCase(), {
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: '13px', color: '#ffffff',
+        stroke: '#1a0a08', strokeThickness: 3,
+        align: 'center',
+        wordWrap: { width: cardW - 60, useAdvancedWrap: true },
       }).setOrigin(0.5));
-
-      // Superpower label + description.
-      const power = ultimate.power;
-      if (power) {
-        add(this.add.text(cardX, cardY + 90, `Superpower: ${power.name}`, {
-          fontFamily: 'Impact, Charcoal, sans-serif',
-          fontSize: '18px', color: '#ffe066',
-          stroke: '#1a0f1f', strokeThickness: 3,
-        }).setOrigin(0.5));
-
-        add(this.add.text(cardX, cardY + 122, power.description, {
-          fontFamily: 'system-ui, sans-serif',
-          fontSize: '13px', color: '#cbb3ff',
-          align: 'center',
-          wordWrap: { width: cardW - 60, useAdvancedWrap: true },
-          lineSpacing: 3,
-        }).setOrigin(0.5, 0));
-      }
     }
 
-    // Buttons. Layout is driven by isReplay (not nextRoute) so that
-    // dev modal previews still get to render the new first-clear layout
-    // even though their right-button routes back to Title under the hood.
-    //   - First-clear runs (or first-clear previews) get a secondary
-    //     "Back to main" on the left + the primary forward CTA on the
-    //     right (Proceed to Level X / Enter the Final Battle / View Roster).
-    //   - Replay runs (or replay previews) get a single centered
-    //     "Back to main" - no forward target to offer.
-    const btnH = 54;
-    const btnY = cardY + cardH / 2 - 50;
-    const isSingleBtn = isReplay;
-
-    // "Your progress is saved." reassurance line. Sits ~22 px above the
-    // button row. Rendered on first-clear runs (real or previewed). Real
-    // replays didn't write to save this run, so the line would be
-    // misleading there - it's suppressed via the isReplay guard.
-    if (!isReplay) {
-      add(this.add.text(cardX, btnY - btnH / 2 - 22,
+    // "Your progress is saved." reassurance line (pixel font), suppressed
+    // on real replays (which didn't write to save). Sits flush below the
+    // brainrot name as part of the centered celebration block.
+    if (showSaved) {
+      add(this.add.text(cardX, savedY,
         'Your progress is saved.', {
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: '12px', color: '#cbb3ff',
-        fontStyle: 'italic',
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: '9px', color: '#cbb3ff',
+        stroke: '#1a0a08', strokeThickness: 2,
       }).setOrigin(0.5));
     }
 
@@ -5433,57 +6392,47 @@ class GameScene extends Phaser.Scene {
       });
     };
 
-    // makeModalButton mirrors the previous single-button visuals for the
-    // primary variant (purple fill, gold-on-hover ring) and adds a quieter
-    // outlined secondary variant for "Back to main" on the two-button path.
-    // We pass label / primary / onClick / x / w because the rest of the
-    // styling is identical across both buttons.
+    // Pixel-font modal button. Mirrors the title-menu button styling so
+    // the visual language is consistent across all narrative + transition
+    // cards.
     const makeModalButton = ({ x, y, w, h, label, primary, onClick }) => {
       const bg = add(this.add.graphics());
+      const accent = primary ? 0xfde58c : 0x6a4f6a;
+      const dim = primary ? 0x0a0610 : 0x1a0f1f;
+      const restColor = primary ? '#fde58c' : '#cbb3ff';
       const drawBg = (hover) => {
         bg.clear();
+        bg.fillStyle(hover ? accent : dim, hover ? 1 : (primary ? 0.92 : 0.7));
+        bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 12);
+        bg.lineStyle(3, accent, 1.0);
+        bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 12);
         if (primary) {
-          bg.fillStyle(hover ? 0x4a3f6a : 0x32254a, 0.95);
-          bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
-          bg.lineStyle(3, hover ? 0xffe066 : 0xcbb3ff, 1.0);
-          bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
-        } else {
-          // Secondary: dim outlined pill so the primary CTA stays the
-          // visual default. Hover lifts the outline + text into the same
-          // gold/light-purple register as the primary so the player still
-          // gets clear "this is tappable" feedback.
-          bg.fillStyle(0x1a0f1f, 0.65);
-          bg.fillRoundedRect(x - w / 2, y - h / 2, w, h, 14);
-          bg.lineStyle(2, hover ? 0xcbb3ff : 0x6a4f6a, 1.0);
-          bg.strokeRoundedRect(x - w / 2, y - h / 2, w, h, 14);
+          bg.lineStyle(1, 0xffe066, 0.55);
+          bg.strokeRoundedRect(x - w / 2 + 5, y - h / 2 + 5, w - 10, h - 10, 9);
         }
       };
       drawBg(false);
       const text = add(this.add.text(x, y, label, {
-        fontFamily: 'Impact, Charcoal, sans-serif',
-        fontSize: primary ? '20px' : '17px',
-        color: primary ? '#ffffff' : '#cbb3ff',
-        stroke: '#1a0f1f', strokeThickness: 3,
-        letterSpacing: 1,
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: primary ? '12px' : '11px',
+        color: restColor,
+        stroke: '#1a0a08', strokeThickness: 3,
+        align: 'center',
       }).setOrigin(0.5));
       const hit = add(this.add.rectangle(x, y, w, h, 0x000000, 0.001));
       hit.setInteractive({ useHandCursor: true });
       hit.on('pointerover', () => {
         drawBg(true);
-        if (!primary) text.setColor('#ffe066');
+        text.setColor('#1a0a08');
       });
       hit.on('pointerout', () => {
         drawBg(false);
-        if (!primary) text.setColor('#cbb3ff');
+        text.setColor(restColor);
       });
       hit.on('pointerdown', onClick);
     };
 
     if (isSingleBtn) {
-      // Replay / modal preview: only "Back to main", centered, primary
-      // styling because there's nothing else competing for attention.
-      // nextButtonLabel is ignored on this path since the user-facing
-      // wording is owned by the modal here, not the caller.
       makeModalButton({
         x: cardX, y: btnY, w: 280, h: btnH,
         label: '\u2190 Back to main',
@@ -5491,11 +6440,10 @@ class GameScene extends Phaser.Scene {
         onClick: () => navigateTo('Title', {}),
       });
     } else {
-      // First clears: secondary "Back to main" on the left, primary forward
-      // CTA on the right (Proceed to Level X / Enter the Final Battle / View
-      // Roster - whatever triggerWin chose). Both fit comfortably in the
-      // card: 2 * 200 + 14 px gap = 414 px, well under cardW = 560.
-      const sideW = 200;
+      // Two-button row. Bumped sideW from 200 -> 250 so the longest
+      // pixel-font label ("Enter the Final Battle") still has a comfortable
+      // margin. 250*2 + 14 = 514, fits cardW = 560.
+      const sideW = 250;
       const gap = 14;
       const totalW = sideW * 2 + gap;
       const leftX = cardX - totalW / 2 + sideW / 2;
@@ -5597,6 +6545,19 @@ class BossScene extends Phaser.Scene {
     this.unlockedUltimates = new Set(
       this.allDeposited.filter((id) => BRAINROT_REGISTRY[id]?.ultimate),
     );
+    // Merge in any saved ultimates so the ability bar AND the prologue
+    // reflect what the player actually has across all clears - not just
+    // whatever this run's `allDeposited` carried in. Covers two cases:
+    //   - Skip-level path: player cleared L1 + L4 only; ability bar
+    //     should still light up Lirili + Hydra slots based on save.
+    //   - Title dev shortcut: TitleScene._launchBoss already stitches
+    //     in everything; this merge is a no-op for that path.
+    const _save = SaveState.read();
+    (_save.unlockedUltimates || []).forEach((id) => this.unlockedUltimates.add(id));
+    this.allDeposited = Array.from(new Set([
+      ...this.allDeposited,
+      ...(_save.unlockedUltimates || []),
+    ]));
     this.hearts = STARTING_HEARTS;
     this.invincibleUntil = 0;
     this.gameOver = false;
@@ -5706,7 +6667,430 @@ class BossScene extends Phaser.Scene {
 
     this.setupCameras();
 
+    this.startBossPrologue();
+  }
+
+  /* ----- pre-fight prologue (intro Zelda card + roster card)
+   *
+   * Plays after createBoss + camera bring-up but BEFORE the boss-reveal
+   * cinematic. Two cards:
+   *   1. Zelda-style intro: "Use your ultimate brainrots / to help you
+   *      fight Los Hackers." (typewriter, auto-fades)
+   *   2. Roster card: a single panel showing all four ultimates, with
+   *      collected ones at full opacity and uncollected ones faded so
+   *      the player sees their actual progress vs the full kit. Stays
+   *      up until the player clicks the LET'S FIGHT button (or hits
+   *      space / enter).
+   *
+   * After the roster card closes we hand off to startBossReveal() which
+   * runs the rumble + rise + FIGHT! beat that already existed.
+   *
+   * Cleanup is symmetric: any pending delayedCalls + active card
+   * graphics + typer events are torn down on prologue end / scene
+   * shutdown.
+   */
+  startBossPrologue() {
+    this.introActive = true;
+    this.prologueActive = true;
+    this.prologueScheduledCalls = [];
+    this.prologueCardObjects = [];
+    this.prologueRosterReady = false;
+
+    // Hide the boss BEFORE the prologue plays. createBoss() drops the
+    // sprite at full alpha at the arena center, but we don't want the
+    // player staring at Los Hackers while reading the cards. Same
+    // collapse-down state that startBossReveal would re-apply later -
+    // front-loaded so the prologue reads as "no boss yet, just the hatch".
+    if (this.bossSprite) {
+      const bossX = ARENA_W / 2;
+      const bossY = ARENA_H / 2;
+      this.bossSprite.setAlpha(0);
+      this.bossSprite.setPosition(bossX, bossY + 60);
+      this.bossSprite.setScale(this.bossNormalScaleX, this.bossNormalScaleY * 0.08);
+      this.bossSprite.setDepth(bossY);
+    }
+
+    // Card 1: Zelda-style intro, sets the stakes + hands off to roster.
+    const introText = 'Use your ultimate brainrots\nto help you fight Los Hackers.';
+    const introDur = introText.length * 50 + 900 + 320;
+
+    this.prologueScheduledCalls.push(
+      this.time.delayedCall(250, () => {
+        if (!this.prologueActive) return;
+        this._showBossPrologueCard(introText);
+      }),
+    );
+
+    // Card 2: roster card. Always renders (locked rows simply show as
+    // faded), so the player sees what they're missing. The card stays
+    // visible until the user clicks the LET'S FIGHT button - no auto
+    // dismiss, no general pointer skip during this phase.
+    const rosterStartT = 250 + introDur + 200;
+    this.prologueScheduledCalls.push(
+      this.time.delayedCall(rosterStartT, () => {
+        if (!this.prologueActive) return;
+        this.prologueRosterReady = true;
+        this._showRosterCard();
+      }),
+    );
+
+    // Keyboard shortcut for the LET'S FIGHT button. Only fires once the
+    // roster card is actually up - keystrokes during the intro card do
+    // nothing (the typewriter is meant to be read, not interrupted).
+    const confirmKey = () => {
+      if (!this.prologueActive || !this.prologueRosterReady) return;
+      this.endBossPrologue();
+    };
+    this.input.keyboard.on('keydown-SPACE', confirmKey);
+    this.input.keyboard.on('keydown-ENTER', confirmKey);
+    this._prologueSkipHandler = confirmKey;
+  }
+
+  endBossPrologue() {
+    if (!this.prologueActive) return;
+    this.prologueActive = false;
+
+    if (this.prologueScheduledCalls) {
+      this.prologueScheduledCalls.forEach((c) => c?.remove(false));
+      this.prologueScheduledCalls = [];
+    }
+    if (this.prologueCardObjects) {
+      this.prologueCardObjects.forEach((o) => {
+        if (!o) return;
+        if (typeof o.destroy === 'function') o.destroy();
+        else if (typeof o.remove === 'function') o.remove(false);
+      });
+      this.prologueCardObjects = [];
+    }
+
+    if (this._prologueSkipHandler) {
+      this.input.keyboard.off('keydown-SPACE', this._prologueSkipHandler);
+      this.input.keyboard.off('keydown-ENTER', this._prologueSkipHandler);
+      this._prologueSkipHandler = null;
+    }
+    this.prologueRosterReady = false;
+
     this.startBossReveal();
+  }
+
+  // Zelda-style card variant for the prologue: same dialog-box + pixel-
+  // font typewriter as showZeldaCard, but anchored a bit lower (so the
+  // hatch + the rising boss are still partially visible behind it),
+  // slightly faster typewriter, and tracked in `prologueCardObjects`
+  // so endBossPrologue can rip them out on skip.
+  _showBossPrologueCard(text) {
+    const W = GAME_W;
+    const H = GAME_H;
+
+    const CHAR_DELAY_MS = 50;
+    const LINGER_MS     = 900;
+    const FADE_MS       = 320;
+
+    const dim = this.add.graphics().setScrollFactor(0).setDepth(15999);
+    dim.fillStyle(0x000000, 0.55);
+    dim.fillRect(0, 0, W, H);
+    dim.setAlpha(0);
+    if (this.cameras && this.cameras.main) this.cameras.main.ignore(dim);
+    if (this.skyCamera) this.skyCamera.ignore(dim);
+    this.tweens.add({ targets: dim, alpha: 1, duration: 240, ease: 'Quad.easeOut' });
+
+    const boxW = Math.min(560, W * 0.86);
+    const boxH = 100;
+    const boxCx = W / 2;
+    const boxCy = H * 0.34;
+    const box = this.add.graphics().setScrollFactor(0).setDepth(16000);
+    box.fillStyle(0x0a0610, 0.94);
+    box.fillRoundedRect(boxCx - boxW / 2, boxCy - boxH / 2, boxW, boxH, 8);
+    box.lineStyle(3, 0xfde58c, 0.95);
+    box.strokeRoundedRect(boxCx - boxW / 2, boxCy - boxH / 2, boxW, boxH, 8);
+    box.lineStyle(1, 0xffe066, 0.55);
+    box.strokeRoundedRect(boxCx - boxW / 2 + 5, boxCy - boxH / 2 + 5, boxW - 10, boxH - 10, 6);
+    box.setAlpha(0);
+    if (this.cameras && this.cameras.main) this.cameras.main.ignore(box);
+    if (this.skyCamera) this.skyCamera.ignore(box);
+    this.tweens.add({ targets: box, alpha: 1, duration: 240, ease: 'Quad.easeOut' });
+
+    const card = this.add.text(boxCx, boxCy, '', {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '13px',
+      color: '#fde58c',
+      stroke: '#1a0a08',
+      strokeThickness: 3,
+      align: 'center',
+      lineSpacing: 8,
+      wordWrap: { width: boxW - 36 },
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(16001).setAlpha(0);
+    card.setShadow(2, 2, '#3a2410', 3, true, true);
+    if (this.cameras && this.cameras.main) this.cameras.main.ignore(card);
+    if (this.skyCamera) this.skyCamera.ignore(card);
+    this.tweens.add({ targets: card, alpha: 1, duration: 240 });
+
+    let i = 0;
+    const typer = this.time.addEvent({
+      delay: CHAR_DELAY_MS,
+      repeat: text.length - 1,
+      callback: () => {
+        i++;
+        if (card?.scene) card.setText(text.slice(0, i));
+      },
+    });
+
+    const lingerEnd = text.length * CHAR_DELAY_MS + LINGER_MS;
+    const fadeTween = this.tweens.add({
+      targets: [dim, box, card],
+      alpha: 0,
+      delay: lingerEnd,
+      duration: FADE_MS,
+      onComplete: () => {
+        dim.destroy();
+        box.destroy();
+        card.destroy();
+        if (typer) typer.remove(false);
+        if (this.prologueCardObjects) {
+          this.prologueCardObjects = this.prologueCardObjects.filter(
+            (o) => o !== dim && o !== box && o !== card && o !== typer && o !== fadeTween,
+          );
+        }
+      },
+    });
+
+    this.prologueCardObjects.push(dim, box, card, typer, fadeTween);
+    return lingerEnd + FADE_MS;
+  }
+
+  // Roster card: a single panel listing every ultimate as a sprite +
+  // brainrot name + power name + activation cue. Used as the second
+  // beat of the prologue (after the introductory Zelda card).
+  //
+  // Behavior:
+  //   - Renders ALL FOUR ultimate slots, regardless of progress.
+  //   - Collected ultimates display at full opacity.
+  //   - Uncollected ultimates dim to alpha 0.25 with a "Clear Level X
+  //     to unlock." hint replacing the activation cue, so the player
+  //     sees what they're missing and what's left to unlock.
+  //   - Card stays up indefinitely. The only way to advance is the
+  //     LET'S FIGHT button (or space / enter as the keyboard
+  //     equivalent of clicking it).
+  //
+  // Layout: row content (avatar + 3-line text block) is measured, then
+  // the avatar+text block is positioned so the card has equal padding
+  // on both sides instead of hugging the left edge.
+  _showRosterCard() {
+    const W = GAME_W;
+    const H = GAME_H;
+
+    const FADE_IN_MS = 320;
+
+    const ALL_ULT_IDS = ['lirili', 'bombardiro', 'capitano', 'hydra'];
+    const INSTRUCTIONS = {
+      lirili:     'Tap (1) to fire a sonic blast.',
+      bombardiro: 'Tap (2) to lob a heavy bomb.',
+      capitano:   'Double-tap a direction to dash.',
+      hydra:      'Hold (4) for the channel beam.',
+    };
+
+    // ult -> level mapping so locked rows can hint "Clear Level N to unlock."
+    const ultLevelMap = {};
+    Object.values(LEVELS).forEach((lv) => {
+      if (lv.ultimateId) ultLevelMap[lv.ultimateId] = lv.id;
+    });
+
+    // Layout constants.
+    const padHoriz   = 36;
+    const padTop     = 22;
+    const padBottom  = 22;
+    const headerH    = 38;
+    const rowH       = 60;
+    const avatarSize = 48;
+    const gap        = 18;
+    const buttonGap  = 18;
+    const buttonH    = 46;
+    const buttonW    = 220;
+
+    const tracked = [];
+    const track = (obj) => {
+      obj.setScrollFactor(0);
+      if (this.cameras && this.cameras.main) this.cameras.main.ignore(obj);
+      if (this.skyCamera) this.skyCamera.ignore(obj);
+      tracked.push(obj);
+      this.prologueCardObjects.push(obj);
+      return obj;
+    };
+
+    // Pre-create text objects off-screen so we can measure the longest
+    // content row and size + center the card layout symmetrically.
+    const rowData = ALL_ULT_IDS.map((id) => {
+      const ult = BRAINROT_REGISTRY[id];
+      const isUnlocked = this.unlockedUltimates.has(id);
+      const levelId = ultLevelMap[id];
+      const instrText = isUnlocked
+        ? (INSTRUCTIONS[id] || '')
+        : (levelId ? `Clear Level ${levelId} to unlock.` : 'Locked.');
+
+      const nameTxt = this.add.text(-9999, -9999, ult.name.toUpperCase(), {
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: '11px', color: '#ffe066',
+        stroke: '#1a0a08', strokeThickness: 3,
+      }).setOrigin(0, 0.5);
+      const powerTxt = this.add.text(-9999, -9999, ult.power?.name || '', {
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: '10px', color: '#fde58c',
+        stroke: '#1a0a08', strokeThickness: 2,
+      }).setOrigin(0, 0.5);
+      const instrTxt = this.add.text(-9999, -9999, instrText, {
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: '8px', color: '#cbb3ff',
+        stroke: '#1a0a08', strokeThickness: 2,
+      }).setOrigin(0, 0.5);
+
+      return { id, ult, isUnlocked, nameTxt, powerTxt, instrTxt };
+    });
+
+    // Find the widest row's text-block width so every avatar lines up
+    // and the whole content rectangle is centered in the card.
+    const maxTextW = Math.max(
+      0,
+      ...rowData.map((r) => Math.max(r.nameTxt.width, r.powerTxt.width, r.instrTxt.width)),
+    );
+
+    const rowBlockW = avatarSize + gap + maxTextW;
+    const cardW = padHoriz * 2 + rowBlockW;
+    const cardH = padTop + headerH
+      + rowH * ALL_ULT_IDS.length
+      + buttonGap + buttonH + padBottom;
+    const cardCx = W / 2;
+    const cardCy = H / 2;
+    const cardLeft = cardCx - cardW / 2;
+    const cardTop  = cardCy - cardH / 2;
+
+    // Center the avatar+text block across the card horizontally so the
+    // avatar isn't shoved against the left edge. Text is left-aligned
+    // within that block - shorter rows simply don't reach the right
+    // padding boundary, which reads naturally.
+    const blockLeftX = cardCx - rowBlockW / 2;
+    const avatarCx   = blockLeftX + avatarSize / 2;
+    const textLeftX  = blockLeftX + avatarSize + gap;
+
+    // Dim vignette behind the card.
+    const dim = track(this.add.graphics().setDepth(15999));
+    dim.fillStyle(0x000000, 0.62);
+    dim.fillRect(0, 0, W, H);
+
+    // Card panel: shadow + dark plum body + gold border + inner gold rim
+    // (matches the level-complete modal so the visual language stays
+    // consistent across all narrative + transition cards).
+    const panel = track(this.add.graphics().setDepth(16000));
+    panel.fillStyle(0x000000, 0.55);
+    panel.fillRoundedRect(cardLeft + 6, cardTop + 8, cardW, cardH, 14);
+    panel.fillStyle(0x0a0610, 0.97);
+    panel.fillRoundedRect(cardLeft, cardTop, cardW, cardH, 14);
+    panel.lineStyle(3, 0xfde58c, 0.95);
+    panel.strokeRoundedRect(cardLeft, cardTop, cardW, cardH, 14);
+    panel.lineStyle(1, 0xffe066, 0.55);
+    panel.strokeRoundedRect(cardLeft + 5, cardTop + 5, cardW - 10, cardH - 10, 11);
+
+    // Header.
+    const header = track(this.add.text(cardCx, cardTop + padTop + 4, 'YOUR ULTIMATES', {
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '15px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 3,
+    }).setOrigin(0.5, 0).setDepth(16001));
+
+    // Per-ultimate rows. We render all four; locked rows fade to alpha
+    // 0.25 so the player can see what they're missing without it
+    // competing visually with what they actually have.
+    const rowsTopY = cardTop + padTop + headerH;
+    const fullOpacityTargets   = [dim, panel, header];
+    const lockedOpacityTargets = [];
+
+    rowData.forEach(({ id, ult, isUnlocked, nameTxt, powerTxt, instrTxt }, i) => {
+      const rowCy = rowsTopY + rowH * i + rowH / 2;
+
+      let avatar;
+      if (ult.spriteKey && this.textures.exists(ult.spriteKey)) {
+        avatar = this.add.image(avatarCx, rowCy, ult.spriteKey)
+          .setOrigin(0.5)
+          .setDisplaySize(avatarSize, avatarSize);
+      } else {
+        avatar = this.add.text(avatarCx, rowCy,
+          `${ult.emoji}${ult.accent || ''}`,
+          { fontSize: '36px' },
+        ).setOrigin(0.5);
+      }
+      avatar.setDepth(16001);
+      track(avatar);
+
+      // Reposition + register the pre-created (and pre-measured) text
+      // objects on top of the row.
+      nameTxt.setPosition(textLeftX, rowCy - 17).setDepth(16001);
+      powerTxt.setPosition(textLeftX, rowCy + 0).setDepth(16001);
+      instrTxt.setPosition(textLeftX, rowCy + 17).setDepth(16001);
+      track(nameTxt);
+      track(powerTxt);
+      track(instrTxt);
+
+      const rowEls = [avatar, nameTxt, powerTxt, instrTxt];
+      if (isUnlocked) {
+        fullOpacityTargets.push(...rowEls);
+      } else {
+        lockedOpacityTargets.push(...rowEls);
+      }
+    });
+
+    // LET'S FIGHT button at the bottom of the card.
+    const btnX = cardCx;
+    const btnY = cardTop + padTop + headerH
+      + rowH * ALL_ULT_IDS.length
+      + buttonGap + buttonH / 2;
+
+    const btnBg = track(this.add.graphics().setDepth(16001));
+    const drawBtnBg = (hover) => {
+      btnBg.clear();
+      btnBg.fillStyle(hover ? 0xfde58c : 0x0a0610, hover ? 1 : 0.92);
+      btnBg.fillRoundedRect(btnX - buttonW / 2, btnY - buttonH / 2, buttonW, buttonH, 10);
+      btnBg.lineStyle(3, 0xfde58c, 1);
+      btnBg.strokeRoundedRect(btnX - buttonW / 2, btnY - buttonH / 2, buttonW, buttonH, 10);
+      btnBg.lineStyle(1, 0xffe066, 0.55);
+      btnBg.strokeRoundedRect(btnX - buttonW / 2 + 5, btnY - buttonH / 2 + 5,
+        buttonW - 10, buttonH - 10, 7);
+    };
+    drawBtnBg(false);
+
+    const btnLabel = track(this.add.text(btnX, btnY, "LET'S FIGHT", {
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '13px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 3,
+    }).setOrigin(0.5).setDepth(16002));
+
+    const btnHit = this.add.rectangle(btnX, btnY, buttonW, buttonH, 0x000000, 0.001)
+      .setScrollFactor(0).setDepth(16003);
+    btnHit.setInteractive({ useHandCursor: true });
+    if (this.cameras && this.cameras.main) this.cameras.main.ignore(btnHit);
+    if (this.skyCamera) this.skyCamera.ignore(btnHit);
+    btnHit.on('pointerover', () => { drawBtnBg(true); btnLabel.setColor('#1a0a08'); });
+    btnHit.on('pointerout',  () => { drawBtnBg(false); btnLabel.setColor('#fde58c'); });
+    btnHit.on('pointerdown', () => { this.endBossPrologue(); });
+    tracked.push(btnHit);
+    this.prologueCardObjects.push(btnHit);
+    fullOpacityTargets.push(btnBg, btnLabel, btnHit);
+
+    // Fade everything in. Two parallel tweens so locked rows can settle
+    // at alpha 0.25 instead of 1 once the entrance completes.
+    tracked.forEach((el) => el.setAlpha(0));
+    this.tweens.add({
+      targets: fullOpacityTargets,
+      alpha: 1,
+      duration: FADE_IN_MS,
+      ease: 'Quad.easeOut',
+    });
+    if (lockedOpacityTargets.length) {
+      this.tweens.add({
+        targets: lockedOpacityTargets,
+        alpha: 0.25,
+        duration: FADE_IN_MS,
+        ease: 'Quad.easeOut',
+      });
+    }
   }
 
   /* ----- boss reveal mini-cinematic ----- */
@@ -6626,9 +8010,9 @@ class BossScene extends Phaser.Scene {
 
   spawnDamageNumber(x, y, amount) {
     const t = this.add.text(x, y, `-${amount}`, {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '26px', color: '#ffe066',
-      stroke: '#1a0f1f', strokeThickness: 4,
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '14px', color: '#ffe066',
+      stroke: '#1a0a08', strokeThickness: 4,
     }).setOrigin(0.5).setDepth(y + 600);
     this.tweens.add({
       targets: t,
@@ -6718,26 +8102,28 @@ class BossScene extends Phaser.Scene {
 
   createBossHud() {
     const W = GAME_W;
-    // Boss banner + HP bar across the top
+    // Boss banner (pixel font, danger red) + HP bar across the top.
     this.add.text(W / 2, 12, 'LOS HACKERS', {
-      fontFamily: 'Impact, Charcoal, sans-serif',
-      fontSize: '20px', color: '#ff3a3a',
-      stroke: '#1a0f1f', strokeThickness: 5,
-      letterSpacing: 2,
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '14px', color: '#ff3a3a',
+      stroke: '#1a0a08', strokeThickness: 4,
     }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(10000);
 
     this.bossHpBg = this.add.graphics().setScrollFactor(0).setDepth(10000);
     this.bossHpFill = this.add.graphics().setScrollFactor(0).setDepth(10001);
     this.drawBossHpBar();
 
-    // Hearts top-left
+    // Pixel-art hearts top-left, scaled slightly smaller than the GameScene
+    // HUD so they don't crowd the boss HP bar.
     this.hudHearts = [];
     const heartSpacing = 30;
+    const heartPx = 3;
+    const heartH = PIXEL_HEART_PATTERN.length * heartPx;
+    const heartCenterY = 16 + heartH / 2;
     for (let i = 0; i < STARTING_HEARTS; i++) {
-      const h = this.add.text(16 + i * heartSpacing, 16, '❤️', {
-        fontSize: '22px',
+      const h = makePixelHeart(this, 22 + i * heartSpacing, heartCenterY, {
+        px: heartPx,
       })
-        .setOrigin(0, 0)
         .setScrollFactor(0)
         .setDepth(10000);
       if (i >= this.hearts) h.setAlpha(0.2);
@@ -6745,11 +8131,12 @@ class BossScene extends Phaser.Scene {
     }
 
     // Bottom-left gameplay hint - rotates as more abilities come online.
-    this.add.text(16, GAME_H - 18,
-      '1: Wail · 2: Bomb · 2× arrow: Dash · hold 4: Hydra Beam   |   dodge red zones!', {
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: '11px', color: '#cbb3ff',
-        stroke: '#1a0f1f', strokeThickness: 3,
+    // Pixel font, very small, so it doesn't crowd the ability bar above.
+    this.add.text(16, GAME_H - 14,
+      '1 Wail  2 Bomb  2x dir Dash  hold 4 Hydra  -  dodge red zones', {
+        fontFamily: '"Press Start 2P", Georgia, sans-serif',
+        fontSize: '8px', color: '#cbb3ff',
+        stroke: '#1a0a08', strokeThickness: 3,
       }).setOrigin(0, 1).setScrollFactor(0).setDepth(10000);
   }
 
@@ -6870,8 +8257,9 @@ class BossScene extends Phaser.Scene {
       if (!unlocked) icon.setAlpha(0.35);
     }
     const hint = this.add.text(0, 22, hotkeyLabel, {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '10px', color: '#cbb3ff',
+      fontFamily: '"Press Start 2P", Georgia, sans-serif',
+      fontSize: '8px', color: '#cbb3ff',
+      stroke: '#1a0a08', strokeThickness: 2,
     }).setOrigin(0.5);
     container.add([bg, icon, hint]);
 
@@ -7704,13 +9092,112 @@ class BossScene extends Phaser.Scene {
     }
     this.flashText('LOS HACKERS DEFEATED', 1600);
 
+    // v0.6.3 narrative outro: brainrots emerge from hiding, two storybook
+    // cards land with TTS, then we route to WinScene. The actual sequence
+    // starts after a beat so 'LOS HACKERS DEFEATED' has a moment to read.
+    this.time.delayedCall(1700, () => this.startOutroCelebration());
+  }
+
+  /* ----- v0.6.3 narrative outro ----- */
+  startOutroCelebration() {
+    if (!this.scene.isActive()) return;
+    const cx = this.player ? this.player.x : ARENA_W / 2;
+    const cy = this.player ? this.player.y : ARENA_H / 2;
+
+    // Pull every collectible brainrot id across all 4 levels (deduped -
+    // Frigo Camelo appears on both L2 and L4). Position them in a circle
+    // around the hero so the celebration reads as "they all came back to
+    // you" rather than "a bunch of sprites appeared somewhere distant".
+    const allCollectibleIds = Object.values(LEVELS).flatMap((lv) => lv.brainrotIds);
+    const uniqueIds = [...new Set(allCollectibleIds)];
+
+    // The gameplay camera is at GAME_ZOOM (1.6) so visible world ≈ 500x360.
+    // Radius 180 keeps brainrots inside the visible viewport even at the
+    // arena edges, with enough spacing for 19 brainrots around the circle.
+    const ringRadius = 180;
+    uniqueIds.forEach((id, i) => {
+      const data = BRAINROT_REGISTRY[id];
+      if (!data) return;
+      const angle = (i / uniqueIds.length) * Math.PI * 2 - Math.PI / 2;
+      const x = cx + Math.cos(angle) * ringRadius;
+      const y = cy + Math.sin(angle) * ringRadius * 0.85;
+      const v = makeBrainrotVisual(this, x, y, data, 50);
+      v.setAlpha(0).setScale(0.3);
+      v.setDepth(y);
+
+      this.tweens.add({
+        targets: v,
+        alpha: 1,
+        scaleX: v.baseScaleX ?? 1,
+        scaleY: v.baseScaleY ?? 1,
+        duration: 480,
+        delay: 200 + i * 70,
+        ease: 'Back.easeOut',
+        onComplete: () => {
+          if (!v.scene) return;
+          this.tweens.add({
+            targets: v, y: y - 8,
+            duration: 540 + i * 30,
+            yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+          });
+          // Tiny scatter sparkle on emergence
+          const spark = this.add.graphics().setDepth(y + 0.1);
+          spark.fillStyle(0xffe066, 1);
+          spark.fillCircle(x, y - 16, 3);
+          this.tweens.add({
+            targets: spark, alpha: 0, duration: 500,
+            onComplete: () => spark.destroy(),
+          });
+        },
+      });
+    });
+
+    // Confetti (per-piece graphics, falling + rotating + fading). 30 pieces
+    // strikes a balance between "celebratory" and "not a perf hit on the
+    // older devices we test on".
+    const confettiColors = [0xffe066, 0xff6b9d, 0x9c6bff, 0x66f0ff, 0x4a8c2e, 0xff8a3a];
+    for (let i = 0; i < 30; i++) {
+      const x = cx + Phaser.Math.Between(-260, 260);
+      const y = cy + Phaser.Math.Between(-220, -80);
+      const c = Phaser.Utils.Array.GetRandom(confettiColors);
+      const conf = this.add.graphics().setDepth(9000);
+      conf.fillStyle(c, 1);
+      conf.fillRect(x - 3, y - 3, 6, 6);
+      this.tweens.add({
+        targets: conf,
+        y: y + 320,
+        alpha: 0,
+        angle: Phaser.Math.Between(180, 720),
+        duration: 2400,
+        delay: 400 + i * 50,
+        ease: 'Quad.easeIn',
+        onComplete: () => conf.destroy(),
+      });
+    }
+
+    // Storybook cards (Zelda-style typewriter), mirroring the IntroScene
+    // pacing so opening and ending feel symmetric. No TTS - the user
+    // reads at their own pace.
+    this.time.delayedCall(1500, () => {
+      if (!this.scene.isActive()) return;
+      this.showZeldaCard('The brainrots are safe.');
+    });
+    this.time.delayedCall(4400, () => {
+      if (!this.scene.isActive()) return;
+      this.showZeldaCard('Long live the brainrots.');
+    });
+
+    // Final fade and route to WinScene. ~7.5s of celebration before fade
+    // begins: 0.5s emergence ramp + 2 cards (~5.6s) + 1.4s breather.
     const fadeMs = 700;
-    this.time.delayedCall(1700, () => {
+    this.time.delayedCall(7500, () => {
+      if (!this.scene.isActive()) return;
       this.cameras.main.fade(fadeMs, 30, 18, 50);
       if (this.skyCamera) this.skyCamera.fade(fadeMs, 30, 18, 50);
       if (this.uiCamera) this.uiCamera.fade(fadeMs, 30, 18, 50);
     });
-    this.time.delayedCall(1700 + fadeMs + 50, () => {
+    this.time.delayedCall(7500 + fadeMs + 50, () => {
+      if (!this.scene.isActive()) return;
       this.scene.start('Win', {
         allDeposited: this.allDeposited,
         bossDefeated: true,
@@ -7718,20 +9205,114 @@ class BossScene extends Phaser.Scene {
     });
   }
 
+  // Zelda-style narrative card for the boss outro - same shape as
+  // IntroScene.showZeldaCard but anchored to the UI camera (BossScene
+  // runs three cameras at different zooms, and the existing flashText
+  // already handles this routing pattern).
+  showZeldaCard(text) {
+    const W = GAME_W;
+    const H = GAME_H;
+
+    const CHAR_DELAY_MS = 60;
+    const LINGER_MS     = 1100;
+    const FADE_MS       = 380;
+
+    const dim = this.add.graphics().setScrollFactor(0).setDepth(9999);
+    dim.fillStyle(0x000000, 0.55);
+    dim.fillRect(0, 0, W, H);
+    dim.setAlpha(0);
+    if (this.cameras && this.cameras.main) this.cameras.main.ignore(dim);
+    if (this.skyCamera) this.skyCamera.ignore(dim);
+    this.tweens.add({ targets: dim, alpha: 1, duration: 280, ease: 'Quad.easeOut' });
+
+    const boxW = Math.min(560, W * 0.86);
+    const boxH = 80;
+    const boxCx = W / 2;
+    const boxCy = H * 0.13;
+    const box = this.add.graphics().setScrollFactor(0).setDepth(10000);
+    box.fillStyle(0x0a0610, 0.94);
+    box.fillRoundedRect(boxCx - boxW / 2, boxCy - boxH / 2, boxW, boxH, 8);
+    box.lineStyle(3, 0xfde58c, 0.95);
+    box.strokeRoundedRect(boxCx - boxW / 2, boxCy - boxH / 2, boxW, boxH, 8);
+    box.lineStyle(1, 0xffe066, 0.55);
+    box.strokeRoundedRect(boxCx - boxW / 2 + 5, boxCy - boxH / 2 + 5, boxW - 10, boxH - 10, 6);
+    box.setAlpha(0);
+    if (this.cameras && this.cameras.main) this.cameras.main.ignore(box);
+    if (this.skyCamera) this.skyCamera.ignore(box);
+    this.tweens.add({ targets: box, alpha: 1, duration: 280, ease: 'Quad.easeOut' });
+
+    const card = this.add.text(boxCx, boxCy, '', {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '13px',
+      color: '#fde58c',
+      stroke: '#1a0a08',
+      strokeThickness: 3,
+      align: 'center',
+      lineSpacing: 6,
+      wordWrap: { width: boxW - 36 },
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(10001).setAlpha(0);
+    card.setShadow(2, 2, '#3a2410', 3, true, true);
+    if (this.cameras && this.cameras.main) this.cameras.main.ignore(card);
+    if (this.skyCamera) this.skyCamera.ignore(card);
+    this.tweens.add({ targets: card, alpha: 1, duration: 280 });
+
+    let i = 0;
+    const typer = this.time.addEvent({
+      delay: CHAR_DELAY_MS,
+      repeat: text.length - 1,
+      callback: () => {
+        i++;
+        if (card?.scene) card.setText(text.slice(0, i));
+      },
+    });
+
+    const lingerEnd = text.length * CHAR_DELAY_MS + LINGER_MS;
+    this.tweens.add({
+      targets: [dim, box, card],
+      alpha: 0,
+      delay: lingerEnd,
+      duration: FADE_MS,
+      onComplete: () => {
+        dim.destroy();
+        box.destroy();
+        card.destroy();
+        if (typer) typer.remove(false);
+      },
+    });
+  }
+
   /* ----- text banner (same shape as GameScene.flashText) ----- */
   flashText(message, durationMs = 1500) {
-    const t = this.add.text(GAME_W / 2, 86, message, {
-      fontFamily: 'system-ui, sans-serif',
-      fontSize: '20px', color: '#ffffff',
-      backgroundColor: '#1a0f1fcc',
-      padding: { x: 14, y: 8 },
-    }).setOrigin(0.5).setScrollFactor(0).setDepth(10001);
-    if (this.cameras && this.cameras.main) this.cameras.main.ignore(t);
-    if (this.skyCamera) this.skyCamera.ignore(t);
+    const padX = 18;
+    const padY = 12;
+    const text = this.add.text(GAME_W / 2, 86, message, {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '12px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 3,
+      align: 'center', lineSpacing: 4,
+      wordWrap: { width: GAME_W - 80, useAdvancedWrap: true },
+    }).setOrigin(0.5).setScrollFactor(0).setDepth(10002);
+    const tw = text.width + padX * 2;
+    const th = text.height + padY * 2;
+    const box = this.add.graphics().setScrollFactor(0).setDepth(10001);
+    box.fillStyle(0x0a0610, 0.92);
+    box.fillRoundedRect(GAME_W / 2 - tw / 2, 86 - th / 2, tw, th, 8);
+    box.lineStyle(2, 0xfde58c, 0.9);
+    box.strokeRoundedRect(GAME_W / 2 - tw / 2, 86 - th / 2, tw, th, 8);
+    box.lineStyle(1, 0xffe066, 0.45);
+    box.strokeRoundedRect(GAME_W / 2 - tw / 2 + 4, 86 - th / 2 + 4, tw - 8, th - 8, 6);
+
+    if (this.cameras && this.cameras.main) {
+      this.cameras.main.ignore(text);
+      this.cameras.main.ignore(box);
+    }
+    if (this.skyCamera) {
+      this.skyCamera.ignore(text);
+      this.skyCamera.ignore(box);
+    }
     this.tweens.add({
-      targets: t, alpha: 0, y: 78,
-      delay: durationMs * 0.6, duration: durationMs * 0.4,
-      onComplete: () => t.destroy(),
+      targets: [text, box], alpha: 0, duration: 400, delay: durationMs,
+      onComplete: () => { text.destroy(); box.destroy(); },
     });
   }
 
@@ -7776,6 +9357,15 @@ class WinScene extends Phaser.Scene {
     const W = this.scale.width;
     const H = this.scale.height;
     const bossDefeated = data?.bossDefeated === true;
+
+    // True ending: forest dance party with a controllable hero. The legacy
+    // roster preview below is only reachable via dev shortcuts now (the
+    // production flow always lands here with bossDefeated:true).
+    if (bossDefeated) {
+      this._createTrueEnding(W, H, data);
+      return;
+    }
+
     this.cameras.main.setBackgroundColor('#1a0f1f');
 
     const g = this.add.graphics();
@@ -8105,6 +9695,451 @@ class WinScene extends Phaser.Scene {
       fontSize: '10px', color: '#666666',
     }).setOrigin(0.5, 1);
   }
+
+  /* ====================================================================
+     v0.6.5 True Ending dance party
+
+     Forest at dusk (same backdrop as the title screen) populated with
+     every brainrot in the roster + all four ultimates, all bouncing in
+     unison while a chiptune loop plays. The hero is a controllable
+     sprite the player can wander around the screen with - they're
+     dancing along, not stuck on a static screen.
+
+     Layout from top to bottom:
+       y 0.10  - "THE END" headline (large pixel font)
+       y 0.16  - "Survive Fire for Brainrots" subtitle (small pixel)
+       y 0.21  - "created by George Le" credit (smaller pixel)
+       y 0.30..0.85 - dance area (brainrots + hero)
+       y 0.93  - [START OVER] [KEEP PLAYING] buttons
+     ==================================================================== */
+  _createTrueEnding(W, H, data) {
+    Sfx.init();
+    Sfx.resume();
+    Sfx.playHappyLoop({ volume: 0.08 });
+
+    // Forest backdrop (sky gradient, trees, grass, scattered foliage,
+    // sparkles) - same recipe as TitleScene.drawForestBackground so the
+    // ending feels like the player has come home to where the story
+    // started.
+    this._drawTrueEndingForest(W, H);
+
+    // ----- Title block -----
+    this.add.text(W / 2, H * 0.10, 'THE END', {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '36px', color: '#fde58c',
+      stroke: '#1a0a08', strokeThickness: 6,
+      align: 'center',
+    }).setOrigin(0.5).setDepth(10000);
+
+    this.add.text(W / 2, H * 0.16, 'Survive Fire for Brainrots', {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '11px', color: '#ffe8a8',
+      stroke: '#1a0a08', strokeThickness: 3,
+      align: 'center',
+    }).setOrigin(0.5).setDepth(10000);
+
+    this.add.text(W / 2, H * 0.21, 'created by George Le', {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '8px', color: '#cbb3ff',
+      stroke: '#1a0a08', strokeThickness: 2,
+      align: 'center',
+    }).setOrigin(0.5).setDepth(10000);
+
+    // Dance area bounds. Player + brainrots are clamped here so they
+    // never overlap the title block above or the buttons below.
+    this.danceBounds = {
+      minX: 50, maxX: W - 50,
+      minY: H * 0.30, maxY: H * 0.86,
+    };
+
+    const collectedIds = new Set(data?.allDeposited ?? []);
+    // Always include the four ultimates (the player has unlocked all of
+    // them by definition - they just beat the boss). De-dupe so Frigo
+    // (who appears in L2 and L4) only spawns once.
+    const allCollectibleIds = Object.values(LEVELS).flatMap((lv) => lv.brainrotIds);
+    const ultimateIds = Object.values(LEVELS).map((lv) => lv.ultimateId);
+    const danceIds = [...new Set([...allCollectibleIds, ...ultimateIds])];
+
+    this._spawnDancingBrainrots(danceIds, collectedIds, ultimateIds);
+    this._createDancingPlayer(W, H);
+    this._createTrueEndingButtons(W, H);
+
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      Sfx.stopHappyLoop();
+    });
+  }
+
+  // Static forest backdrop. Lifted from TitleScene.drawForestBackground
+  // and tuned slightly (denser sparkles in the canopy) to match the
+  // celebration vibe.
+  _drawTrueEndingForest(W, H) {
+    const sky = this.add.graphics();
+    for (let y = 0; y < H; y += 4) {
+      const t = y / H;
+      const r = Math.floor(120 + (1 - t) * 80);
+      const gr = Math.floor(170 + (1 - t) * 40);
+      const b = Math.floor(190 - t * 60);
+      sky.fillStyle((r << 16) | (gr << 8) | b, 1);
+      sky.fillRect(0, y, W, 4);
+    }
+    sky.fillStyle(0xfff5c4, 0.10);
+    for (let i = 0; i < 6; i++) {
+      const x = (W / 6) * i + 30;
+      sky.fillTriangle(x, 0, x - 40, H, x + 40, H);
+    }
+
+    const treeBand = this.add.graphics();
+    for (let i = 0; i < 8; i++) {
+      const cx = (W / 8) * i + 45;
+      const cy = H * 0.55;
+      treeBand.fillStyle(0x3a2616, 1);
+      treeBand.fillRect(cx - 8, cy - 2, 16, 36);
+      treeBand.fillStyle(0x1f4a14, 1);
+      treeBand.fillCircle(cx, cy - 28, 32);
+      treeBand.fillCircle(cx - 18, cy - 20, 24);
+      treeBand.fillCircle(cx + 18, cy - 20, 24);
+      treeBand.fillStyle(0x2f6a1c, 1);
+      treeBand.fillCircle(cx - 6, cy - 34, 18);
+      treeBand.fillCircle(cx + 10, cy - 32, 16);
+    }
+
+    const floor = this.add.graphics();
+    floor.fillStyle(0x2a4a1a, 1);
+    floor.fillRect(0, H * 0.55, W, H * 0.45);
+    floor.fillStyle(0x1f3a14, 0.55);
+    for (let i = 0; i < 50; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(Math.round(H * 0.56), H);
+      const r = Phaser.Math.Between(20, 60);
+      floor.fillCircle(x, y, r);
+    }
+
+    const scatter = this.add.graphics();
+    for (let i = 0; i < 80; i++) {
+      const x = Phaser.Math.Between(0, W);
+      const y = Phaser.Math.Between(Math.round(H * 0.58), H - 10);
+      const kind = Math.random();
+      if (kind < 0.55) {
+        scatter.lineStyle(2, 0x6db84a, 0.85);
+        scatter.lineBetween(x - 3, y + 4, x - 3, y - 2);
+        scatter.lineBetween(x,     y + 4, x,     y - 4);
+        scatter.lineBetween(x + 3, y + 4, x + 3, y - 1);
+      } else if (kind < 0.85) {
+        scatter.fillStyle(0x4a8c2e, 0.85);
+        scatter.fillCircle(x, y, 4);
+        scatter.fillCircle(x + 4, y - 1, 3);
+        scatter.fillCircle(x - 4, y - 1, 3);
+      } else {
+        scatter.fillStyle(0xfff8e8, 1);
+        scatter.fillRect(x - 1, y, 2, 4);
+        scatter.fillStyle(0xc8323a, 1);
+        scatter.fillCircle(x, y, 3);
+      }
+    }
+
+    // Twinkle layer - more numerous + a touch brighter than TitleScene
+    // because this is a celebration, not a "looming" intro.
+    for (let i = 0; i < 22; i++) {
+      const sx = Phaser.Math.Between(40, W - 40);
+      const sy = Phaser.Math.Between(60, Math.round(H * 0.55));
+      const s = this.add.graphics();
+      s.fillStyle(0xfff5c4, 0.85);
+      s.fillCircle(sx, sy, 1.5);
+      s.setAlpha(0.3);
+      this.tweens.add({
+        targets: s, alpha: 1.0,
+        duration: 700 + i * 70,
+        yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+      });
+    }
+  }
+
+  // Pop each brainrot in with a Back.easeOut entrance, then start a
+  // continuous bounce + sway dance. Ultimates get a gentle scale pulse
+  // and a sparkle pip overhead so they read as the "VIPs" of the party.
+  _spawnDancingBrainrots(ids, collectedIds, ultimateIds) {
+    if (ids.length === 0) return;
+    const ultSet = new Set(ultimateIds);
+
+    const minX = this.danceBounds.minX;
+    const maxX = this.danceBounds.maxX;
+    const minY = this.danceBounds.minY;
+    const maxY = this.danceBounds.maxY;
+
+    // 6-column grid layout w/ jitter so the crowd looks organic. Rows
+    // sized to fit however many ids we have (up to ~22).
+    const cols = 6;
+    const rows = Math.max(1, Math.ceil(ids.length / cols));
+    const colW = (maxX - minX) / cols;
+    const rowH = (maxY - minY) / rows;
+
+    ids.forEach((id, i) => {
+      const data = BRAINROT_REGISTRY[id];
+      if (!data) return;
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const baseX = minX + colW * (col + 0.5) + Phaser.Math.Between(-12, 12);
+      const baseY = minY + rowH * (row + 0.5) + Phaser.Math.Between(-8, 8);
+      const isUlt = ultSet.has(id);
+      const everCollected = collectedIds.has(id);
+
+      // Wrap each brainrot in a container so the bounce/sway tweens act
+      // on the inner sprite without fighting the world position. (The
+      // hero gets the same treatment - see _createDancingPlayer.)
+      const c = this.add.container(baseX, baseY);
+      const v = makeBrainrotVisual(this, 0, 0, data, isUlt ? 56 : 48);
+      c.add(v);
+      c.setDepth(baseY);
+      c.setAlpha(0).setScale(0.2);
+
+      this.tweens.add({
+        targets: c,
+        alpha: 1, scaleX: 1, scaleY: 1,
+        duration: 460,
+        delay: 200 + i * 55,
+        ease: 'Back.easeOut',
+        onComplete: () => {
+          if (!c.scene) return;
+          // Bounce. Per-sprite duration jitter (mod 3) means the crowd
+          // doesn't bounce in lockstep, which would look robotic.
+          this.tweens.add({
+            targets: v,
+            y: -14,
+            duration: 320 + (i % 3) * 70,
+            yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+          });
+          // Hip sway.
+          this.tweens.add({
+            targets: v,
+            angle: { from: -7, to: 7 },
+            duration: 540 + (i % 4) * 80,
+            yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+          });
+          // Ultimates pulse a little bigger to mark them as the VIPs.
+          if (isUlt) {
+            const sx = v.baseScaleX ?? 1;
+            const sy = v.baseScaleY ?? 1;
+            this.tweens.add({
+              targets: v,
+              scaleX: sx * 1.10, scaleY: sy * 1.10,
+              duration: 460,
+              yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+            });
+          }
+        },
+      });
+
+      // VIP sparkle for ultimates. A single 2px gold pip overhead that
+      // alpha-pulses; cheap, reads as "shiny" without piling on graphics.
+      if (isUlt) {
+        const sparkle = this.add.graphics().setDepth(baseY + 1);
+        sparkle.fillStyle(0xffe066, 0.95);
+        sparkle.fillCircle(baseX, baseY - 28, 2.5);
+        this.tweens.add({
+          targets: sparkle, alpha: 0.25,
+          duration: 600 + (i * 37) % 200,
+          yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+        });
+      }
+
+      // Faintly de-emphasize brainrots the player never collected (only
+      // possible if they cheat-jumped to the boss). They still dance -
+      // it's a party - just with a lower alpha so the collected crew
+      // pops more.
+      if (!everCollected && !isUlt) c.setAlpha(0.6);
+    });
+  }
+
+  // Hero sprite the player can drive around with WASD/arrows. Wrapped
+  // in a container so the dance tweens (bounce + sway) can run on the
+  // inner sprite without conflicting with the player's input-driven
+  // x/y movement on the container.
+  _createDancingPlayer(W, H) {
+    const startX = W / 2;
+    const startY = (this.danceBounds.minY + this.danceBounds.maxY) / 2 + 30;
+
+    const c = this.add.container(startX, startY);
+    let inner;
+    if (this.textures.exists('sprite_player_boy')) {
+      inner = this.add.image(0, 0, 'sprite_player_boy').setOrigin(0.5);
+      inner.setDisplaySize(60, 60);
+    } else {
+      inner = this.add.text(0, 0, '\u{1F9D2}', { fontSize: '52px' }).setOrigin(0.5);
+    }
+    c.add(inner);
+    c.setDepth(startY);
+    c.setScale(0); c.setAlpha(0);
+
+    this.tweens.add({
+      targets: c,
+      alpha: 1, scaleX: 1, scaleY: 1,
+      duration: 380, delay: 220, ease: 'Back.easeOut',
+      onComplete: () => {
+        if (!c.scene) return;
+        this.tweens.add({
+          targets: inner, y: -16,
+          duration: 300, yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+        });
+        this.tweens.add({
+          targets: inner, angle: { from: -9, to: 9 },
+          duration: 460, yoyo: true, repeat: -1, ease: 'Sine.easeInOut',
+        });
+      },
+    });
+
+    this._player = c;
+    this._cursors = this.input.keyboard.createCursorKeys();
+    this._wasd = this.input.keyboard.addKeys({
+      up: Phaser.Input.Keyboard.KeyCodes.W,
+      down: Phaser.Input.Keyboard.KeyCodes.S,
+      left: Phaser.Input.Keyboard.KeyCodes.A,
+      right: Phaser.Input.Keyboard.KeyCodes.D,
+    });
+  }
+
+  // Two-button row: [START OVER] (destructive, two-tap confirm) and
+  // [KEEP PLAYING] (safe default, also bound to SPACE/ENTER). Mirrors
+  // the level-complete + legacy-non-boss button styling but uses the
+  // pixel font + gold accents to match TitleScene.
+  _createTrueEndingButtons(W, H) {
+    const btnY = H * 0.93;
+    const btnW = 220;
+    const btnH = 50;
+    const gap = 18;
+    const totalW = btnW * 2 + gap;
+    const leftX = W / 2 - totalW / 2 + btnW / 2;
+    const rightX = W / 2 + totalW / 2 - btnW / 2;
+
+    const goTitle = () => {
+      Sfx.stopHappyLoop();
+      this.scene.start('Title');
+    };
+    const reset = () => {
+      Sfx.stopHappyLoop();
+      SaveState.reset();
+      this.scene.start('Title');
+    };
+
+    // Two views, toggled by visibility. Same arm/disarm pattern as the
+    // legacy Win view so an accidental Start Over tap can't strand the
+    // player (5s auto-revert).
+    const primaryNodes = [];
+    const confirmNodes = [];
+    const setView = (which) => {
+      const showConfirm = which === 'confirm';
+      primaryNodes.forEach((n) => n.setVisible(!showConfirm));
+      confirmNodes.forEach((n) => n.setVisible(showConfirm));
+    };
+    let armTimer = null;
+    const disarm = () => {
+      if (armTimer) { armTimer.remove(false); armTimer = null; }
+      setView('primary');
+    };
+    const arm = () => {
+      if (armTimer) armTimer.remove(false);
+      armTimer = this.time.delayedCall(5000, disarm);
+      setView('confirm');
+    };
+
+    primaryNodes.push(this._makeEndingButton(leftX, btnY, btnW, btnH, 'START OVER', { onClick: arm }));
+    primaryNodes.push(this._makeEndingButton(rightX, btnY, btnW, btnH, 'KEEP PLAYING', { onClick: goTitle, primary: true }));
+
+    // Confirm view: warning text above the buttons, dim background bar
+    // behind the text so it stays readable when a brainrot dances under it.
+    const warnY = btnY - btnH / 2 - 22;
+    const warnBg = this.add.graphics().setDepth(9999);
+    warnBg.fillStyle(0x1a0a08, 0.78);
+    warnBg.fillRoundedRect(W / 2 - 280, warnY - 14, 560, 28, 6);
+    confirmNodes.push(warnBg);
+    confirmNodes.push(this.add.text(W / 2, warnY,
+      'LOSE ALL PROGRESS AND START OVER?', {
+        fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+        fontSize: '10px', color: '#ffd6d6',
+        stroke: '#1a0a08', strokeThickness: 3,
+        align: 'center',
+      }).setOrigin(0.5).setDepth(10000));
+    confirmNodes.push(this._makeEndingButton(leftX, btnY, btnW, btnH, 'YES, RESET', { onClick: () => {
+      if (armTimer) { armTimer.remove(false); armTimer = null; }
+      reset();
+    }, danger: true }));
+    confirmNodes.push(this._makeEndingButton(rightX, btnY, btnW, btnH, 'NO, GO BACK', { onClick: disarm, primary: true }));
+
+    setView('primary');
+
+    // Keyboard fallback - SPACE / ENTER pick the safe default. Start
+    // Over is intentionally pointer-only so a stray keypress can't
+    // trigger reset confirmation while the player is dancing around.
+    this.input.keyboard.once('keydown-SPACE', goTitle);
+    this.input.keyboard.once('keydown-ENTER', goTitle);
+  }
+
+  // Pixel-font ending button. Three flavors:
+  //   default  - dim fill, gold border, gold text (Start Over)
+  //   primary  - dim fill, gold border, white-on-gold-on-hover (Keep Playing)
+  //   danger   - dim fill, red border (confirm reset)
+  _makeEndingButton(x, y, w, h, label, opts = {}) {
+    const accent = opts.danger ? 0xff6b6b : 0xfde58c;
+    const dim = 0x0a0610;
+    const idleColor = opts.danger ? '#ffb0b0'
+      : opts.primary ? '#ffffff'
+      : '#fde58c';
+
+    const c = this.add.container(x, y).setDepth(10000);
+    const bg = this.add.graphics();
+    const drawBg = (hover) => {
+      bg.clear();
+      bg.fillStyle(hover ? accent : dim, hover ? 1 : 0.92);
+      bg.fillRoundedRect(-w / 2, -h / 2, w, h, 8);
+      bg.lineStyle(3, accent, 1);
+      bg.strokeRoundedRect(-w / 2, -h / 2, w, h, 8);
+      bg.lineStyle(1, accent, 0.55);
+      bg.strokeRoundedRect(-w / 2 + 5, -h / 2 + 5, w - 10, h - 10, 6);
+    };
+    drawBg(false);
+
+    const text = this.add.text(0, 0, label, {
+      fontFamily: '"Press Start 2P", Georgia, "Times New Roman", serif',
+      fontSize: '12px', color: idleColor,
+      stroke: '#1a0a08', strokeThickness: 3,
+      align: 'center',
+    }).setOrigin(0.5);
+
+    c.add([bg, text]);
+    c.setSize(w, h);
+    c.setInteractive({ useHandCursor: true });
+    c.on('pointerover', () => { drawBg(true); text.setColor('#1a0a08'); });
+    c.on('pointerout',  () => { drawBg(false); text.setColor(idleColor); });
+    c.on('pointerdown', () => { if (opts.onClick) opts.onClick(); });
+
+    return c;
+  }
+
+  // Hero movement loop. Phaser calls update() every frame on the active
+  // scene; we just translate keyboard input into x/y deltas on the
+  // player container, clamped to the dance area.
+  update(_time, delta) {
+    if (!this._player || !this._cursors || !this._wasd) return;
+    const speed = 210;
+    const dt = delta / 1000;
+    let vx = 0, vy = 0;
+    if (this._cursors.left.isDown  || this._wasd.left.isDown)  vx -= 1;
+    if (this._cursors.right.isDown || this._wasd.right.isDown) vx += 1;
+    if (this._cursors.up.isDown    || this._wasd.up.isDown)    vy -= 1;
+    if (this._cursors.down.isDown  || this._wasd.down.isDown)  vy += 1;
+    if (vx === 0 && vy === 0) return;
+    const len = Math.hypot(vx, vy);
+    vx /= len; vy /= len;
+    this._player.x = Phaser.Math.Clamp(
+      this._player.x + vx * speed * dt,
+      this.danceBounds.minX, this.danceBounds.maxX,
+    );
+    this._player.y = Phaser.Math.Clamp(
+      this._player.y + vy * speed * dt,
+      this.danceBounds.minY, this.danceBounds.maxY,
+    );
+    // Re-sort against the dancing brainrots whose depth = their initial y.
+    this._player.setDepth(this._player.y);
+  }
 }
 
 /* ============================================================================
@@ -8126,7 +10161,7 @@ const config = {
     default: 'arcade',
     arcade: { gravity: { y: 0 }, debug: false },
   },
-  scene: [BootScene, TitleScene, GameScene, BossScene, WinScene],
+  scene: [BootScene, IntroScene, TitleScene, GameScene, BossScene, WinScene],
 };
 
 window.addEventListener('load', () => {

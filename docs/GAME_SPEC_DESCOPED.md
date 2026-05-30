@@ -1,7 +1,7 @@
 # Survive Fire for Brainrots — Descoped Spec (1-Day Web Build)
 
-**Version**: 0.6.2 (Persistent progress + 5-pill title + post-boss reset prompt)
-**Last updated**: 2026-05-11
+**Version**: 0.6.3 (Narrative bookends — Zelda-style intro + outro cinematics, pixel font, ambient audio)
+**Last updated**: 2026-05-30
 **Status**: Active build target
 **Relation to north star**: This is a *radically descoped* version of [`GAME_SPEC.md`](./GAME_SPEC.md). The original full-fidelity spec remains the long-term north star. This document defines what we're actually building **today** in a single-day, $0 budget web prototype.
 
@@ -1249,6 +1249,110 @@ Per discussion, the prompt fires **every time** the boss is beaten (not just the
 - **Multi-slot saves** — single shared slot per browser is the intended ergonomic for family share. Adding slots = adding a slot picker UI = scope creep.
 - **Cloud sync** — explicitly out of scope per §20.
 - **Confirmation modal for reset** — replaced by inline tap-twice. Avoids stacking modals on the WinScene which already has a busy roster grid.
+
+---
+
+## 24. v0.6.3 — Narrative bookends (opening + ending cinematics)
+
+The game now has a short story wrapped around the gameplay. v0.6.3 adds two non-interactive cinematics: a ~9-second **opening** (idyllic forest → Los Hackers descends → brainrots scatter → hero rises) before the title screen, and a ~7.5-second **ending** sequence appended onto `BossScene.handleVictory()` (brainrots emerge from hiding around the hero with confetti). Narrative beats are conveyed through **Zelda-style typewriter dialog cards** — bold gold-cream serif text in a bordered dialog box at the bottom of the screen, revealed letter-by-letter on a dim background.
+
+### 24.1 Scope decisions
+
+| Decision | Choice |
+|---|---|
+| Skippability | Skippable. Any tap / key after a 1500 ms grace window ends the intro and writes `introSeen: true`. The outro is unskippable on purpose (it's the player's earned victory beat). |
+| Ending placement | Inline extension of `BossScene.handleVictory()` (Option A). No new `OutroScene`. WinScene route is unchanged. |
+| Voice lines | None. Text-only. The legacy `Tts` module still ships `Tts.narrate()` and `Tts.cancel()` but no scene calls them. |
+| Card style | **Zelda-style typewriter dialog cards.** Full-screen dim vignette (alpha 0.55 black) + a 560×80 bordered dialog box at the **top** of the screen (`H * 0.13`) with bold cream-gold (`#fde58c`) **pixel-style text** (`'Press Start 2P'` Google Font with serif fallback) revealed at **60 ms/char**. Subtle inner gold rim, dark stroke, drop shadow. |
+| Post-intro routing | Drops to `TitleScene`. Player picks L1 from the existing pill row. No auto-launch. |
+| Los Hackers display size | Same as the boss fight — `BOSS_DISPLAY_W × BOSS_DISPLAY_H` (280×180 px). The intro previously rendered the boss at 180×130 which felt small; matching the boss-fight size makes the silhouette read as "the same enormous threat you'll face later". |
+| Ambient audio | Synthesized via Web Audio (`Sfx` module). The idyllic phase plays a gentle bird-chirp loop (random pitch / cluster pattern). When the sky darkens, birds cut and a sustained **dread drone** (detuned saws + perfect-fifth pad through low-pass filter) fades in and runs through the rest of the cinematic. When Los Hackers lands, a **discordant sting** (root + minor 9th + tritone) punches the moment alongside the existing `hit` SFX and camera shake. |
+
+### 24.2 IntroScene
+
+A new `Phaser.Scene` (key `'Intro'`) inserted between `BootScene` and `TitleScene` in the scene array. `BootScene.create()` now starts `'Intro'` instead of `'Title'`.
+
+**Gate logic:**
+- `IntroScene.create(data)` reads `SaveState.read()` and short-circuits to `'Title'` if `introSeen === true && !DEV_MODE && !data?.force`.
+- `data.force === true` (passed by the title-screen "replay intro" link) bypasses the gate.
+- `DEV_MODE` always plays the cinematic so the dev workflow never has to clear localStorage to retest copy/timing.
+
+**Backdrop (drawn entirely with `Phaser.Graphics`, no new assets):**
+- Daylight skybox gradient (mirrors `BossScene.drawForestSkybox` shape).
+- Distant tree band at `H * 0.55`.
+- Mottled grass floor + ferns / mushrooms / grass tufts scatter in the foreground.
+- 16 twinkly sparkles drifting in the upper canopy region (sin-wave alpha modulation in `update`).
+
+**Cast:**
+- 10 brainrots sampled across all 4 levels (`bombo`, `chimpanzini`, `meowl`, `boneca`, `fragola`, `pancake`, `tralalero`, `octopusini`, `arcadragon`, `cocofanto`) bobbing idly in a foreground arc. Sample chosen for visual variety (every level represented) and to tease the full roster without spoiling it.
+- `sprite_los_hackers` descends from above at beat 3 with `Bounce.easeOut`, rendered at `BOSS_DISPLAY_W × BOSS_DISPLAY_H` (280×180 px) so the silhouette matches the boss-fight scale.
+- `sprite_player_boy` rises from the bottom at beat 5 with `Quad.easeOut`.
+
+**Beat schedule:**
+
+| t (ms) | Beat | What happens |
+|---|---|---|
+| 0 | Scene boots | All backdrop visible, brainrots bobbing, **bird ambience starts** (random 600–1600 ms intervals, occasional 2-3 chirp clusters). |
+| 400 | Card 1 | "Long ago, the brainrots lived in peace…" — Zelda dialog box at top, typewriter reveals over ~2.4 s at 60 ms/char. |
+| 1500 | Skip hint reveals | "tap / press any key to skip ▸" fades in (bottom-right). |
+| 4500 | Sky darkens | **Birds cut off**, crimson `0x4a0a18` overlay tweens to alpha 0.55 over 700 ms, camera shake + hit SFX, **dread drone fades in** (detuned A1 saws + fifth pad, sustained through end of cinematic). |
+| 5200 | Los Hackers descends | Drop from y=−160 to y=H*0.42 over 900 ms with `Bounce.easeOut`. Card 2: "Until Los Hackers came." On landing: shake + `hit` SFX + **dread sting** + sinister 1.06× scale pulse loop. |
+| 6300 | Brainrots scatter | Each brainrot tweens to nearest-edge x ± random, dy=−50…−120, alpha→0.18, angle±30°, staggered 55 ms apart. |
+| 8100 | Hero rises | `sprite_player_boy` fades in from H*0.82 → H*0.74. Card 3: "Bring them home." |
+| 10800 | End | Cards / typers / tweens torn down, **bird loop + dread drone stopped**, `SaveState.recordIntroSeen()`, `cameras.main.fade(500)`, then `scene.start('Title')`. |
+
+**Skip path:** identical to natural completion — `endIntro()` writes `introSeen: true`, fades, routes to Title. Skip is gated by `time.now - sceneStartedAt >= 1500` so a stray initial-tap from app-launch can't flash through the intro.
+
+### 24.3 BossScene victory extension
+
+`BossScene.handleVictory()` keeps its existing pre-roll (boss disintegrate tween, "LOS HACKERS DEFEATED" banner, `SaveState.recordBossDefeat()`) untouched, then at `t+1700 ms` calls a new `startOutroCelebration()` instead of the old fade-and-route block.
+
+**`startOutroCelebration()` sequence:**
+
+| t after victory (ms) | Beat | What happens |
+|---|---|---|
+| 1700 | Brainrots emerge | All 19 unique collectible brainrot ids (deduped — Frigo Camelo is on both L2 and L4) scaled-up from 0.3× with `Back.easeOut` in a circle of radius 180 px around the player at 70 ms stagger. Each gets an idle bob-loop on emergence + a small gold sparkle. |
+| 1700–4100 | Confetti | 30 colored squares fall + rotate + fade over 2400 ms with 50 ms staggered delays. Color palette matches the brainrot rosters (gold / pink / purple / cyan / green / orange). |
+| 3200 | Card 1 | "The brainrots are safe." — Zelda dialog box pops in over the gameplay camera, anchored to the UI camera at H * 0.83. |
+| 6100 | Card 2 | "Long live the brainrots." |
+| 9200 | Fade begins | `cameras.main.fade(700)` on all three cameras. |
+| 9950 | Route | `scene.start('Win', { allDeposited, bossDefeated: true })` — existing `TRUE ENDING` WinScene path is unchanged. |
+
+The brainrots use `makeBrainrotVisual()` so they render as PNG sprites if available and fall back to emoji otherwise — same helper used by every other scene that draws brainrots, so a roster refresh in the registry automatically flows through.
+
+### 24.4 Save schema bump (compatible)
+
+`SaveState` schema v1 gains an `introSeen: boolean` field. v1 reads from saves written by v0.6.2 default it to `false` (because `parsed?.introSeen === true` evaluates `false` for missing fields), so a returning player from v0.6.2 will see the intro exactly once on their next visit, then have it auto-skip thereafter. No schema bump needed.
+
+A new `SaveState.recordIntroSeen()` helper sets the flag in one call; both the natural-completion path and the skip path call it.
+
+### 24.5 Sfx module additions (v0.6.3 polish pass)
+
+Three new helpers on the existing `Sfx` module, all synthesized via Web Audio (no new asset files):
+
+- **`Sfx.chirp()`** — single bird chirp. Sine wave, randomized start frequency (2400–4200 Hz), 60% upward / 40% downward sweep, ~70–160 ms with a quick attack + exponential decay. The IntroScene schedules these via `time.delayedCall` at random 600–1600 ms intervals, with a 35 % chance of a 2-3 chirp cluster (60-140 ms apart) for natural variety. The bird loop self-cancels via a `_birdLoopActive` flag so sky-darken / endIntro can stop it cleanly.
+- **`Sfx.playDreadDrone({ durationMs, fadeInMs, fadeOutMs })`** — sustained low drone built from two slightly detuned saw waves (~A1, +12 cents) plus a sine pad on the perfect fifth, all routed through a low-pass filter (140 Hz, Q=2) for the thick "something is wrong" pad. Stores oscillator handles on `Sfx._droneNodes`.
+- **`Sfx.stopDreadDrone()`** — gracefully ramps the drone down (250 ms) and stops the oscillators. Called from `IntroScene.endIntro()` and the `SHUTDOWN` handler.
+- **`Sfx.playDreadSting()`** — discordant cluster (A3 + A#3 + D#4 — root + minor 9th + tritone) with a slight downward bend, 1.1 s. Plays once when Los Hackers lands.
+
+The old `Tts.narrate` / `Tts.cancel` helpers from earlier v0.6.3 development still ship on the `Tts` module but no scene calls them — the cards are silent reads paired with the new ambient audio bed.
+
+### 24.6 TitleScene addition
+
+A small dim `▸ replay intro` link sits at the bottom-left of the title screen (mirrors the dev hint at the bottom-right). Always rendered — not gated by `DEV_MODE` — so any curious player can rewatch the cinematic. The click handler routes to `'Intro'` with `{ force: true }`. The intro itself rewrites `introSeen: true` on completion/skip, so save state stays consistent regardless of how many times it's replayed.
+
+### 24.7 Card cleanup on skip
+
+Each `showZeldaCard` call pushes its dim overlay, dialog box, text node, typewriter `TimerEvent`, and fade tween onto a per-scene `activeCardObjects` array. `endIntro()` walks that array and explicitly destroys / removes each entry **before** calling `tweens.killAll()`, because `killAll` would otherwise prevent the fade tween's `onComplete` (which destroys the graphics) from ever firing — leaving zombie card graphics that would survive into the title scene.
+
+### 24.8 Things deliberately NOT in this slice
+
+- **TTS narration** — the design briefly shipped with English `Tts.narrate()` calls on every card; user feedback during playtest preferred silent Zelda-style typewriter reading. The `Tts.narrate` / `Tts.cancel` helpers stayed on the module (cheap to keep around) but no scene calls them.
+- **Background music for intro/outro** — narrative SFX only (hit sting on darken/scatter, win sting already in handleVictory). Music remains the same backlog item from §10.
+- **Skip-to-end vs. skip-to-title for the outro** — the outro is short (~7.5 s) and represents the player's earned victory beat. Skipping it would feel deflating. We made it unskippable on purpose.
+- **Pixel-art font for true Zelda authenticity** — uses bold Georgia serif as a system-font compromise. Loading a webfont would mean a network request before the intro can render, which would hurt cold-load feel.
+- **Cinematic camera moves on the outro** (zoom-out to whole arena) — keep the camera pinned to the hero so the celebration reads as "they came back to YOU" rather than "they appeared somewhere distant".
+- **Auto-launching L1 after the intro** — explicitly drops to TitleScene per scoping. Players still pick when to begin.
 
 ---
 
